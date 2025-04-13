@@ -14,3 +14,9 @@ impl BlockRef {
         }
     }
 }
+
+impl Default for BlockRef {
+    fn default() -> Self {
+        Self(-1)
+    }
+}

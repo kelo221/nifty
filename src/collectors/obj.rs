@@ -365,7 +365,7 @@ impl Obj {
     }
 
     pub fn visit_source_texture(&mut self, source_texture: &NiSourceTexture) -> Option<String> {
-        if source_texture.use_external == 0 {
+        if !source_texture.use_external {
             return None;
         }
 

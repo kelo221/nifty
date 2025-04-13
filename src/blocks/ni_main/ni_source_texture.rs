@@ -1,21 +1,22 @@
+use crate::common::BlockRef;
+
 use super::ni_object_net::NiObjectNET;
 use super::ni_string::NiString;
-use crate::error::NifError;
 use binrw::{
     io::{Read, Seek},
     BinRead, BinReaderExt,
 };
 
 #[derive(Debug, PartialEq, BinRead)]
-#[br(assert(!direct_render, NifError::NotImplemented("Direct Render")))]
 pub struct NiSourceTexture {
     pub base: NiObjectNET,
-    pub use_external: u8,
+    #[br(map = |x: u8| x > 0)]
+    pub use_external: bool,
     pub file_name: NiString,
-    #[br(if(use_external == 1))]
+    #[br(if(use_external))]
     pub unknown_link_ref: Option<i32>,
-    #[br(if(use_external == 0))]
-    pub pixel_data_ref: Option<i32>,
+    #[br(if(!use_external))]
+    pub pixel_data_ref: BlockRef,
     pub pixel_layout: PixelLayout,
     pub mipmap_format: MipMapFormat,
     pub alpha_format: AlphaFormat,

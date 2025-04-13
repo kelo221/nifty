@@ -1,0 +1,44 @@
+use crate::common::BlockRef;
+
+use super::NiAvObject;
+
+use binrw::{
+    io::{Read, Seek},
+    BinRead, BinReaderExt,
+};
+
+#[derive(Debug, PartialEq, BinRead)]
+pub struct NiCamera {
+    pub base: NiAvObject,
+    pub flags: u16,
+    pub frustum_left: f32,
+    pub frustum_right: f32,
+    pub frustum_top: f32,
+    pub frustum_bottom: f32,
+    pub frustum_near: f32,
+    pub frustum_far: f32,
+    #[br(map = |x: u8| x > 0)]
+    pub use_orthographic_projection: bool,
+    pub viewport_left: f32,
+    pub viewport_right: f32,
+    pub viewport_top: f32,
+    pub viewport_bottom: f32,
+    pub lod_adjust: f32,
+    pub scene: BlockRef,
+    pub num_screen_polygons: u32,
+    pub num_screen_textures: u32,
+}
+
+impl NiCamera {
+    pub fn parse<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Self> {
+        Ok(reader.read_le()?)
+    }
+}
+
+impl std::ops::Deref for NiCamera {
+    type Target = NiAvObject;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}

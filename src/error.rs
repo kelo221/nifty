@@ -4,7 +4,7 @@ use thiserror::Error;
 pub enum NifError {
     #[error("nif feature \"{0}\" is not implemented")]
     NotImplemented(&'static str),
-    #[error("encountered unknown block")]
+    #[error("encountered unknown block {0} of type \"{1}\"")]
     UnknownBlock(usize, String),
     #[error("an invalid block type index was specified")]
     InvalidBlockTypeIndex,

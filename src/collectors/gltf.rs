@@ -513,7 +513,7 @@ impl Gltf {
                         .expect("invalid property ref");
 
                     if let Block::NiSourceTexture(source_texture) = diffuse_source {
-                        if source_texture.use_external > 0 {
+                        if source_texture.use_external {
                             let file_name = source_texture
                                 .file_name
                                 .value

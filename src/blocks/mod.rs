@@ -89,6 +89,8 @@ pub enum Block {
     NiPSysResetOnLoopCtlr(NiPSysResetOnLoopCtlr),
     NiDirectionalLight(NiDirectionalLight),
     NiFloatsExtraData(NiFloatsExtraData),
+    NiCamera(NiCamera),
+    NiPointLight(NiPointLight),
 }
 
 impl Block {
@@ -172,6 +174,8 @@ impl Block {
             Block::NiPSysResetOnLoopCtlr(_) => "NiPSysResetOnLoopCtlr",
             Block::NiDirectionalLight(_) => "NiDirectionalLight",
             Block::NiFloatsExtraData(_) => "NiFloatsExtraData",
+            Block::NiCamera(_) => "NiCamera",
+            Block::NiPointLight(_) => "NiPointLight",
         }
     }
 
