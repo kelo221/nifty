@@ -91,6 +91,9 @@ pub enum Block {
     NiFloatsExtraData(NiFloatsExtraData),
     NiCamera(NiCamera),
     NiPointLight(NiPointLight),
+    NiLookAtInterpolator(NiLookAtInterpolator),
+    NiSpotLight(NiSpotLight),
+    NiAmbientLight(NiAmbientLight),
 }
 
 impl Block {
@@ -176,6 +179,9 @@ impl Block {
             Block::NiFloatsExtraData(_) => "NiFloatsExtraData",
             Block::NiCamera(_) => "NiCamera",
             Block::NiPointLight(_) => "NiPointLight",
+            Block::NiLookAtInterpolator(_) => "NiLookAtInterpolator",
+            Block::NiSpotLight(_) => "NiSpotLight",
+            Block::NiAmbientLight(_) => "NiAmbientLight",
         }
     }
 

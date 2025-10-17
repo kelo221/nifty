@@ -332,6 +332,15 @@ pub fn parse_blocks(strings: Vec<String>, block_type_indices: Vec<u16>) -> BinRe
                     "NiPointLight" => {
                         Block::NiPointLight(NiPointLight::read_options(reader, endian, ())?)
                     }
+                    "NiLookAtInterpolator" => Block::NiLookAtInterpolator(
+                        NiLookAtInterpolator::read_options(reader, endian, ())?,
+                    ),
+                    "NiSpotLight" => {
+                        Block::NiSpotLight(NiSpotLight::read_options(reader, endian, ())?)
+                    }
+                    "NiAmbientLight" => {
+                        Block::NiAmbientLight(NiAmbientLight::read_options(reader, endian, ())?)
+                    }
                     _ => {
                         return Err(binrw::Error::Custom {
                             pos: reader.stream_position()?,

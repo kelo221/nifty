@@ -12,16 +12,17 @@ pub struct NiGeometry {
     pub base: NiAvObject,
     pub data_ref: BlockRef,
     pub skin_instance_ref: BlockRef,
-    #[br(map = |x: u8| x > 0)]
-    pub has_shader: bool,
-    #[br(if(has_shader))]
-    pub material_data: Option<MaterialDataShader>,
+    pub material_data: MaterialData,
 }
 
 #[derive(Debug, PartialEq, BinRead)]
-pub struct MaterialDataShader {
-    pub name: NiString,
-    pub extra_data_ref: BlockRef,
+pub struct MaterialData {
+    #[br(map = |x: u8| x > 0)]
+    pub has_shader: bool,
+    #[br(if(has_shader))]
+    pub shader_name: Option<NiString>,
+    #[br(if(has_shader))]
+    pub shader_extra_data_ref: Option<BlockRef>,
 }
 
 impl NiGeometry {

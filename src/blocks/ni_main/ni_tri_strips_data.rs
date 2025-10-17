@@ -15,7 +15,7 @@ pub struct NiTriStripsData {
     #[br(map = |x: u8| x > 0)]
     pub has_points: bool,
     #[br(if(has_points), count = num_strips * strip_lengths.iter().sum::<u16>())]
-    pub strips: Option<Vec<u16>>,
+    pub points: Option<Vec<u16>>,
 }
 
 impl NiTriStripsData {
