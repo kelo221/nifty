@@ -491,10 +491,7 @@ impl Writer<'_> {
                 Err(GlbError::MissingTexture(path.to_owned()))
             };
         };
-        let decoded = image::load_from_memory(bytes).map_err(|error| GlbError::TextureDecode {
-            path: path.to_owned(),
-            message: error.to_string(),
-        })?;
+        let decoded = decode_texture(path, bytes)?;
         let mut png = Cursor::new(Vec::new());
         decoded
             .write_to(&mut png, image::ImageFormat::Png)
@@ -600,6 +597,153 @@ impl Writer<'_> {
     }
 }
 
+fn decode_texture(path: &str, bytes: &[u8]) -> Result<image::DynamicImage, GlbError> {
+    let layout = bc1_layout(bytes).map_err(|message| GlbError::TextureDecode {
+        path: path.to_owned(),
+        message,
+    })?;
+    let decode_bytes = match layout {
+        Some(layout) if !layout.width.is_multiple_of(4) || !layout.height.is_multiple_of(4) => {
+            let mut padded = bytes.to_vec();
+            padded[12..16].copy_from_slice(&layout.height.next_multiple_of(4).to_le_bytes());
+            padded[16..20].copy_from_slice(&layout.width.next_multiple_of(4).to_le_bytes());
+            Cow::Owned(padded)
+        }
+        _ => Cow::Borrowed(bytes),
+    };
+    let mut decoded =
+        image::load_from_memory(&decode_bytes).map_err(|error| GlbError::TextureDecode {
+            path: path.to_owned(),
+            message: error.to_string(),
+        })?;
+    let Some(layout) = layout else {
+        return Ok(decoded);
+    };
+    if decoded.width() != layout.width || decoded.height() != layout.height {
+        decoded = decoded.crop_imm(0, 0, layout.width, layout.height);
+    }
+
+    let mut rgba = decoded.to_rgba8();
+    if rgba.width() != layout.width || rgba.height() != layout.height {
+        return Err(GlbError::TextureDecode {
+            path: path.to_owned(),
+            message: format!(
+                "BC1 header dimensions {}x{} do not match decoded image {}x{}",
+                layout.width,
+                layout.height,
+                rgba.width(),
+                rgba.height()
+            ),
+        });
+    }
+
+    let block_width = layout.width.div_ceil(4);
+    let block_height = layout.height.div_ceil(4);
+    for block_y in 0..block_height {
+        for block_x in 0..block_width {
+            let block_index = u64::from(block_y) * u64::from(block_width) + u64::from(block_x);
+            let byte_offset = layout.offset
+                + usize::try_from(block_index * 8).map_err(|_| GlbError::TextureDecode {
+                    path: path.to_owned(),
+                    message: "BC1 block offset exceeds the addressable range".into(),
+                })?;
+            let block = &bytes[byte_offset..byte_offset + 8];
+            let color_0 = u16::from_le_bytes([block[0], block[1]]);
+            let color_1 = u16::from_le_bytes([block[2], block[3]]);
+            let selectors = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+            let has_transparent_selector = color_0 <= color_1;
+
+            for local_y in 0..4 {
+                let y = block_y * 4 + local_y;
+                if y >= layout.height {
+                    break;
+                }
+                for local_x in 0..4 {
+                    let x = block_x * 4 + local_x;
+                    if x >= layout.width {
+                        break;
+                    }
+                    let selector_index = local_y * 4 + local_x;
+                    let selector = (selectors >> (selector_index * 2)) & 0x3;
+                    rgba.get_pixel_mut(x, y)[3] = if has_transparent_selector && selector == 3 {
+                        0
+                    } else {
+                        255
+                    };
+                }
+            }
+        }
+    }
+    Ok(image::DynamicImage::ImageRgba8(rgba))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Bc1Layout {
+    offset: usize,
+    width: u32,
+    height: u32,
+}
+
+fn bc1_layout(bytes: &[u8]) -> Result<Option<Bc1Layout>, String> {
+    if !bytes.starts_with(b"DDS ") {
+        return Ok(None);
+    }
+    if bytes.len() < 128 {
+        return Err("DDS header is truncated".into());
+    }
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    let height = read_u32(12);
+    let width = read_u32(16);
+    if width == 0 || height == 0 {
+        return Err("DDS dimensions must be nonzero".into());
+    }
+
+    let four_cc = &bytes[84..88];
+    let offset = if four_cc == b"DXT1" {
+        128
+    } else if four_cc == b"DX10" {
+        if bytes.len() < 148 {
+            return Err("DDS DX10 header is truncated".into());
+        }
+        if !matches!(read_u32(128), 70..=72) {
+            return Ok(None);
+        }
+        148
+    } else {
+        return Ok(None);
+    };
+
+    let block_width = u64::from(width.div_ceil(4));
+    let block_height = u64::from(height.div_ceil(4));
+    let byte_length = block_width
+        .checked_mul(block_height)
+        .and_then(|blocks| blocks.checked_mul(8))
+        .ok_or_else(|| "BC1 payload length overflowed".to_owned())?;
+    let end = u64::try_from(offset)
+        .ok()
+        .and_then(|offset| offset.checked_add(byte_length))
+        .and_then(|end| usize::try_from(end).ok())
+        .ok_or_else(|| "BC1 payload range overflowed".to_owned())?;
+    if end > bytes.len() {
+        return Err(format!(
+            "BC1 payload is truncated: need {end} bytes, found {}",
+            bytes.len()
+        ));
+    }
+    Ok(Some(Bc1Layout {
+        offset,
+        width,
+        height,
+    }))
+}
+
 fn position_bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
     let mut minimum = [f32::INFINITY; 3];
     let mut maximum = [f32::NEG_INFINITY; 3];
@@ -619,6 +763,145 @@ fn extras(value: serde_json::Value) -> Result<json::Extras, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dds_block(four_cc: &[u8; 4], width: u32, height: u32, block: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 128];
+        bytes[0..4].copy_from_slice(b"DDS ");
+        bytes[4..8].copy_from_slice(&124u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&0x0002_100fu32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&height.to_le_bytes());
+        bytes[16..20].copy_from_slice(&width.to_le_bytes());
+        bytes[20..24].copy_from_slice(&(block.len() as u32).to_le_bytes());
+        bytes[76..80].copy_from_slice(&32u32.to_le_bytes());
+        bytes[80..84].copy_from_slice(&4u32.to_le_bytes());
+        bytes[84..88].copy_from_slice(four_cc);
+        bytes[108..112].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes.extend_from_slice(block);
+        bytes
+    }
+
+    fn dxt1_block(color_0: u16, color_1: u16, selectors: u32) -> [u8; 8] {
+        let mut block = [0; 8];
+        block[0..2].copy_from_slice(&color_0.to_le_bytes());
+        block[2..4].copy_from_slice(&color_1.to_le_bytes());
+        block[4..8].copy_from_slice(&selectors.to_le_bytes());
+        block
+    }
+
+    fn dx10_bc1(width: u32, height: u32, block: &[u8]) -> Vec<u8> {
+        let mut bytes = dds_block(b"DX10", width, height, &[]);
+        bytes.extend_from_slice(&[0; 20]);
+        bytes[128..132].copy_from_slice(&71u32.to_le_bytes());
+        bytes[132..136].copy_from_slice(&3u32.to_le_bytes());
+        bytes[140..144].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(block);
+        bytes
+    }
+
+    #[test]
+    fn dxt1_three_color_selector_three_restores_binary_alpha() {
+        let bytes = dds_block(b"DXT1", 4, 4, &dxt1_block(0, u16::MAX, u32::MAX));
+        let decoded = decode_texture("cutout.dds", &bytes).expect("decode DXT1 cutout");
+        assert!(decoded.to_rgba8().pixels().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn dxt1_four_color_selector_three_stays_opaque() {
+        let bytes = dds_block(b"DXT1", 4, 4, &dxt1_block(u16::MAX, 0, u32::MAX));
+        let decoded = decode_texture("opaque.dds", &bytes).expect("decode opaque DXT1");
+        assert!(decoded.to_rgba8().pixels().all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn dx10_bc1_restores_binary_alpha() {
+        let bytes = dx10_bc1(4, 4, &dxt1_block(0, u16::MAX, u32::MAX));
+        let decoded = decode_texture("cutout-dx10.dds", &bytes).expect("decode DX10 BC1 cutout");
+        assert!(decoded.to_rgba8().pixels().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn dxt1_alpha_crops_padded_pixels_for_non_block_dimensions() {
+        let bytes = dds_block(b"DXT1", 3, 2, &dxt1_block(0, u16::MAX, u32::MAX));
+        let decoded = decode_texture("cropped.dds", &bytes).expect("decode cropped DXT1");
+        assert_eq!((decoded.width(), decoded.height()), (3, 2));
+        assert_eq!(decoded.to_rgba8().pixels().count(), 6);
+        assert!(decoded.to_rgba8().pixels().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn truncated_dxt1_payload_is_a_structured_texture_error() {
+        let mut bytes = dds_block(b"DXT1", 4, 4, &dxt1_block(0, u16::MAX, 0));
+        bytes.pop();
+        let error = decode_texture("truncated.dds", &bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            GlbError::TextureDecode { path, .. } if path == "truncated.dds"
+        ));
+    }
+
+    #[test]
+    fn dxt3_and_dxt5_keep_the_image_decoder_alpha() {
+        let mut dxt3 = [0; 16];
+        dxt3[8..16].copy_from_slice(&dxt1_block(u16::MAX, 0, 0));
+        let decoded =
+            decode_texture("dxt3.dds", &dds_block(b"DXT3", 4, 4, &dxt3)).expect("decode DXT3");
+        assert!(decoded.to_rgba8().pixels().all(|pixel| pixel[3] == 0));
+
+        let mut dxt5 = [0; 16];
+        dxt5[0] = 0;
+        dxt5[1] = 255;
+        dxt5[8..16].copy_from_slice(&dxt1_block(u16::MAX, 0, 0));
+        let decoded =
+            decode_texture("dxt5.dds", &dds_block(b"DXT5", 4, 4, &dxt5)).expect("decode DXT5");
+        assert!(decoded.to_rgba8().pixels().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn encoded_glb_validates_and_embeds_corrected_rgba() {
+        let texture_path = "textures/cutout.dds";
+        let scene = Scene {
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            materials: vec![SceneMaterial {
+                name: "Cutout".into(),
+                base_color: [1.0; 4],
+                emissive: [0.0; 3],
+                emissive_multiplier: 1.0,
+                roughness: 1.0,
+                alpha_mode: SceneAlphaMode::Mask,
+                alpha_cutoff: Some(0.5),
+                double_sided: false,
+                unlit: false,
+                diffuse_texture: Some(texture_path.into()),
+                normal_texture: None,
+                glow_texture: None,
+            }],
+            issues: Vec::new(),
+            statistics: super::super::SceneStatistics::default(),
+            animations: Vec::new(),
+        };
+        let mut textures = BTreeMap::new();
+        textures.insert(
+            texture_path.into(),
+            dds_block(b"DXT1", 4, 4, &dxt1_block(0, u16::MAX, u32::MAX)),
+        );
+        let output = encode_glb(&scene, &textures, &GlbOptions::default()).expect("encode GLB");
+        let gltf = gltf::Gltf::from_slice(&output.bytes).expect("validate GLB");
+        assert_eq!(
+            gltf.document.materials().next().unwrap().alpha_mode(),
+            gltf::material::AlphaMode::Mask
+        );
+        let blob = gltf.blob.as_deref().expect("GLB binary chunk");
+        let source = gltf.document.images().next().unwrap().source();
+        let gltf::image::Source::View { view, .. } = source else {
+            panic!("embedded image must use a buffer view");
+        };
+        let png = &blob[view.offset()..view.offset() + view.length()];
+        let image = image::load_from_memory(png)
+            .expect("decode embedded PNG")
+            .to_rgba8();
+        assert!(image.pixels().all(|pixel| pixel[3] == 0));
+    }
 
     #[test]
     fn position_bounds_cover_every_axis() {

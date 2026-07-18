@@ -767,15 +767,10 @@ fn make_material(
         .or_else(|| material.and_then(|value| value.object.name.clone()))
         .unwrap_or_else(|| "Material".into());
     let alpha_value = material.map_or(1.0, |value| value.alpha.clamp(0.0, 1.0));
-    let (alpha_mode, alpha_cutoff) = match alpha {
-        Some(value) if value.flags & 0x0200 != 0 => (
-            SceneAlphaMode::Mask,
-            Some(f32::from(value.threshold) / 255.0),
-        ),
-        Some(value) if value.flags & 0x0001 != 0 => (SceneAlphaMode::Blend, None),
-        _ if alpha_value < 1.0 => (SceneAlphaMode::Blend, None),
-        _ => (SceneAlphaMode::Opaque, None),
-    };
+    let (alpha_mode, alpha_cutoff) = alpha_policy(
+        alpha.map(|value| (value.flags, value.threshold)),
+        alpha_value,
+    );
     let texture = |slot: usize| {
         textures
             .and_then(|value| value.textures.get(slot))
@@ -803,6 +798,17 @@ fn make_material(
     }
 }
 
+fn alpha_policy(alpha: Option<(u16, u8)>, material_alpha: f32) -> (SceneAlphaMode, Option<f32>) {
+    match alpha {
+        Some((flags, _)) if flags & 0x0001 != 0 => (SceneAlphaMode::Blend, None),
+        Some((flags, threshold)) if flags & 0x0200 != 0 => {
+            (SceneAlphaMode::Mask, Some(f32::from(threshold) / 255.0))
+        }
+        _ if material_alpha < 1.0 => (SceneAlphaMode::Blend, None),
+        _ => (SceneAlphaMode::Opaque, None),
+    }
+}
+
 pub fn normalize_texture_path(path: &str) -> String {
     path.trim_matches('\0')
         .replace('\\', "/")
@@ -813,6 +819,39 @@ pub fn normalize_texture_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alpha_policy_prefers_blend_when_blend_and_test_are_both_authored() {
+        assert_eq!(
+            alpha_policy(Some((0x0001 | 0x0200, 128)), 1.0),
+            (SceneAlphaMode::Blend, None)
+        );
+    }
+
+    #[test]
+    fn alpha_policy_uses_blend_when_only_blending_is_authored() {
+        assert_eq!(
+            alpha_policy(Some((0x0001, 128)), 1.0),
+            (SceneAlphaMode::Blend, None)
+        );
+    }
+
+    #[test]
+    fn alpha_policy_preserves_mask_cutoff_when_only_testing_is_authored() {
+        assert_eq!(
+            alpha_policy(Some((0x0200, 120)), 1.0),
+            (SceneAlphaMode::Mask, Some(120.0 / 255.0))
+        );
+    }
+
+    #[test]
+    fn alpha_policy_uses_material_alpha_only_without_authored_alpha_flags() {
+        assert_eq!(alpha_policy(None, 0.5), (SceneAlphaMode::Blend, None));
+        assert_eq!(
+            alpha_policy(Some((0, 200)), 1.0),
+            (SceneAlphaMode::Opaque, None)
+        );
+    }
 
     #[test]
     fn triangle_strips_alternate_winding_and_drop_degenerates() {
