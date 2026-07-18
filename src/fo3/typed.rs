@@ -212,6 +212,47 @@ pub struct ShaderTextureSet {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SkinInstance {
+    pub data: i32,
+    pub skin_partition: i32,
+    pub skeleton_root: i32,
+    pub bones: Vec<i32>,
+    pub partitions: Vec<BodyPartPartition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyPartPartition {
+    pub flags: u16,
+    pub body_part: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkinData {
+    pub skin_transform: Transform,
+    pub bones: Vec<SkinBoneData>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkinBoneData {
+    pub skin_transform: Transform,
+    pub vertex_weights: Vec<(u16, f32)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkinPartitionData {
+    pub partitions: Vec<SkinPartition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkinPartition {
+    pub bones: Vec<u16>,
+    pub vertex_map: Vec<u16>,
+    pub vertex_weights: Vec<Vec<f32>>,
+    pub triangles: Vec<[u16; 3]>,
+    pub bone_indices: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypedBlock {
     Node(Node),
     Geometry(Geometry),
@@ -222,6 +263,9 @@ pub enum TypedBlock {
     PpLightingProperty(PpLightingProperty),
     NoLightingProperty(NoLightingProperty),
     ShaderTextureSet(ShaderTextureSet),
+    SkinInstance(SkinInstance),
+    SkinData(SkinData),
+    SkinPartitionData(SkinPartitionData),
     CollisionObject(CollisionObject),
     RigidBody(RigidBody),
     SimpleShapePhantom(SimpleShapePhantom),
@@ -294,6 +338,13 @@ impl Document {
                 "BSShaderTextureSet" => {
                     TypedBlock::ShaderTextureSet(parse_texture_set(block, &mut reader)?)
                 }
+                "NiSkinInstance" | "BSDismemberSkinInstance" => {
+                    TypedBlock::SkinInstance(parse_skin_instance(block, &mut reader)?)
+                }
+                "NiSkinData" => TypedBlock::SkinData(parse_skin_data(block, &mut reader)?),
+                "NiSkinPartition" => {
+                    TypedBlock::SkinPartitionData(parse_skin_partition_data(block, &mut reader)?)
+                }
                 _ => return Ok(TypedBlock::Unsupported),
             }
         };
@@ -312,6 +363,221 @@ impl Document {
             .map(|index| self.decode_block(index))
             .collect()
     }
+}
+
+fn parse_skin_instance(
+    block: &RawBlock,
+    reader: &mut Reader<'_>,
+) -> Result<SkinInstance, Fo3Error> {
+    let data = reader.read_i32("skin data reference")?;
+    let skin_partition = reader.read_i32("skin partition reference")?;
+    let skeleton_root = reader.read_i32("skeleton root reference")?;
+    let bone_count = reader.read_u32("skin bone count")? as usize;
+    let bone_count = checked_count(block, reader, bone_count, 4, "skin bone")?;
+    let mut bones = Vec::with_capacity(bone_count);
+    for _ in 0..bone_count {
+        bones.push(reader.read_i32("skin bone reference")?);
+    }
+    let mut partitions = Vec::new();
+    if block.type_name == "BSDismemberSkinInstance" {
+        let partition_count = reader.read_u32("body partition count")? as usize;
+        let partition_count = checked_count(block, reader, partition_count, 4, "body partition")?;
+        partitions.reserve(partition_count);
+        for _ in 0..partition_count {
+            partitions.push(BodyPartPartition {
+                flags: reader.read_u16("body partition flags")?,
+                body_part: reader.read_u16("body partition type")?,
+            });
+        }
+    }
+    Ok(SkinInstance {
+        data,
+        skin_partition,
+        skeleton_root,
+        bones,
+        partitions,
+    })
+}
+
+fn parse_skin_data(block: &RawBlock, reader: &mut Reader<'_>) -> Result<SkinData, Fo3Error> {
+    let skin_transform = read_transform(reader, "skin transform")?;
+    let bone_count = reader.read_u32("skin data bone count")? as usize;
+    let has_vertex_weights = reader.read_u8("has skin vertex weights")? != 0;
+    let minimum_bone_bytes = if has_vertex_weights { 70 } else { 70 - 6 };
+    let bone_count = checked_count(
+        block,
+        reader,
+        bone_count,
+        minimum_bone_bytes,
+        "skin data bone",
+    )?;
+    let mut bones = Vec::with_capacity(bone_count);
+    for _ in 0..bone_count {
+        let skin_transform = read_transform(reader, "bone skin transform")?;
+        let _bound_center = read_vec3(reader, "bone bound center")?;
+        let _bound_radius = reader.read_f32("bone bound radius")?;
+        let vertex_count = reader.read_u16("bone vertex weight count")? as usize;
+        let vertex_count = if has_vertex_weights {
+            checked_count(block, reader, vertex_count, 6, "bone vertex weight")?
+        } else {
+            0
+        };
+        let mut vertex_weights = Vec::with_capacity(vertex_count);
+        for _ in 0..vertex_count {
+            vertex_weights.push((
+                reader.read_u16("weighted vertex index")?,
+                reader.read_f32("vertex weight")?,
+            ));
+        }
+        bones.push(SkinBoneData {
+            skin_transform,
+            vertex_weights,
+        });
+    }
+    Ok(SkinData {
+        skin_transform,
+        bones,
+    })
+}
+
+fn parse_skin_partition_data(
+    block: &RawBlock,
+    reader: &mut Reader<'_>,
+) -> Result<SkinPartitionData, Fo3Error> {
+    let partition_count = reader.read_u32("skin partition count")? as usize;
+    let partition_count = checked_count(block, reader, partition_count, 10, "skin partition")?;
+    let mut partitions = Vec::with_capacity(partition_count);
+    for _ in 0..partition_count {
+        let vertex_count = reader.read_u16("partition vertex count")? as usize;
+        let triangle_count = reader.read_u16("partition triangle count")? as usize;
+        let bone_count = reader.read_u16("partition bone count")? as usize;
+        let strip_count = reader.read_u16("partition strip count")? as usize;
+        let weights_per_vertex = reader.read_u16("partition weights per vertex")? as usize;
+
+        let bone_count = checked_count(block, reader, bone_count, 2, "partition bone")?;
+        let mut bones = Vec::with_capacity(bone_count);
+        for _ in 0..bone_count {
+            bones.push(reader.read_u16("partition bone")?);
+        }
+
+        let has_vertex_map = reader.read_u8("has partition vertex map")? != 0;
+        let mut vertex_map = Vec::new();
+        if has_vertex_map {
+            let count = checked_count(block, reader, vertex_count, 2, "partition vertex map")?;
+            vertex_map.reserve(count);
+            for _ in 0..count {
+                vertex_map.push(reader.read_u16("partition vertex map")?);
+            }
+        }
+
+        let has_vertex_weights = reader.read_u8("has partition vertex weights")? != 0;
+        let mut vertex_weights = Vec::new();
+        if has_vertex_weights {
+            let total = vertex_count
+                .checked_mul(weights_per_vertex)
+                .ok_or(Fo3Error::Overflow("partition vertex weight count"))?;
+            checked_count(block, reader, total, 4, "partition vertex weight")?;
+            vertex_weights.reserve(vertex_count);
+            for _ in 0..vertex_count {
+                let mut weights = Vec::with_capacity(weights_per_vertex);
+                for _ in 0..weights_per_vertex {
+                    weights.push(reader.read_f32("partition vertex weight")?);
+                }
+                vertex_weights.push(weights);
+            }
+        }
+
+        let strip_count = checked_count(block, reader, strip_count, 2, "partition strip length")?;
+        let mut strip_lengths = Vec::with_capacity(strip_count);
+        for _ in 0..strip_count {
+            strip_lengths.push(reader.read_u16("partition strip length")? as usize);
+        }
+        let has_faces = reader.read_u8("has partition faces")? != 0;
+        let mut triangles = Vec::new();
+        if has_faces && strip_count != 0 {
+            let index_count = strip_lengths.iter().try_fold(0usize, |sum, count| {
+                sum.checked_add(*count)
+                    .ok_or(Fo3Error::Overflow("partition strip index count"))
+            })?;
+            checked_count(block, reader, index_count, 2, "partition strip index")?;
+            let mut strip_indices = Vec::with_capacity(index_count);
+            for _ in 0..index_count {
+                strip_indices.push(reader.read_u16("partition strip index")?);
+            }
+            let mut offset = 0;
+            for length in strip_lengths {
+                triangles.extend(triangulate_partition_strip(
+                    &strip_indices[offset..offset + length],
+                ));
+                offset += length;
+            }
+        } else if has_faces {
+            let triangle_count =
+                checked_count(block, reader, triangle_count, 6, "partition triangle")?;
+            triangles.reserve(triangle_count);
+            for _ in 0..triangle_count {
+                triangles.push([
+                    reader.read_u16("partition triangle")?,
+                    reader.read_u16("partition triangle")?,
+                    reader.read_u16("partition triangle")?,
+                ]);
+            }
+        }
+
+        let has_bone_indices = reader.read_u8("has partition bone indices")? != 0;
+        let mut bone_indices = Vec::new();
+        if has_bone_indices {
+            let total = vertex_count
+                .checked_mul(weights_per_vertex)
+                .ok_or(Fo3Error::Overflow("partition bone index count"))?;
+            checked_count(block, reader, total, 1, "partition bone index")?;
+            bone_indices.reserve(vertex_count);
+            for _ in 0..vertex_count {
+                let mut indices = Vec::with_capacity(weights_per_vertex);
+                for _ in 0..weights_per_vertex {
+                    indices.push(reader.read_u8("partition bone index")?);
+                }
+                bone_indices.push(indices);
+            }
+        }
+        partitions.push(SkinPartition {
+            bones,
+            vertex_map,
+            vertex_weights,
+            triangles,
+            bone_indices,
+        });
+    }
+    Ok(SkinPartitionData { partitions })
+}
+
+fn triangulate_partition_strip(strip: &[u16]) -> Vec<[u16; 3]> {
+    let mut triangles = Vec::new();
+    for (index, window) in strip.windows(3).enumerate() {
+        let triangle = if index % 2 == 0 {
+            [window[0], window[1], window[2]]
+        } else {
+            [window[1], window[0], window[2]]
+        };
+        if triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[0] != triangle[2] {
+            triangles.push(triangle);
+        }
+    }
+    triangles
+}
+
+fn read_transform(reader: &mut Reader<'_>, field: &'static str) -> Result<Transform, Fo3Error> {
+    let mut rotation = [0.0; 9];
+    for value in &mut rotation {
+        *value = reader.read_f32(field)?;
+    }
+    let translation = read_vec3(reader, field)?;
+    let scale = reader.read_f32(field)?;
+    Ok(Transform {
+        translation,
+        rotation,
+        scale,
+    })
 }
 
 fn parse_object_net(

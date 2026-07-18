@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use super::{
     Scene, SceneAlphaMode, SceneAnimation, SceneAnimationChannel, SceneMaterial, SceneMesh,
+    SceneSkin,
 };
 
 const NIF_UNITS_PER_METRE: f32 = 70.0;
@@ -99,9 +100,14 @@ pub fn encode_glb(
             rotation: Some(UnitQuaternion(rotation.to_array())),
             scale: Some([node.transform.scale; 3]),
             translation: Some(node.transform.translation),
-            skin: None,
+            skin: node.skin.map(|index| Index::new(index as u32)),
             weights: None,
         });
+    }
+
+    for skin in &scene.skins {
+        let skin = writer.skin(skin);
+        writer.root.skins.push(skin);
     }
 
     for animation in &scene.animations {
@@ -365,6 +371,27 @@ impl Writer<'_> {
             );
             attributes.insert(Valid(mesh::Semantic::TexCoords(0)), tex_coords);
         }
+        if !source.joints.is_empty() {
+            let joints = self.u16_vector_accessor(
+                source.joints.iter().flatten().copied(),
+                source.joints.len(),
+                accessor::Type::Vec4,
+                buffer::Target::ArrayBuffer,
+                format!("{} joints", source.name),
+            );
+            attributes.insert(Valid(mesh::Semantic::Joints(0)), joints);
+        }
+        if !source.weights.is_empty() {
+            let weights = self.f32_accessor(
+                source.weights.iter().flatten().copied(),
+                source.weights.len(),
+                accessor::Type::Vec4,
+                None,
+                buffer::Target::ArrayBuffer,
+                format!("{} weights", source.name),
+            );
+            attributes.insert(Valid(mesh::Semantic::Weights(0)), weights);
+        }
         let indices = self.u16_accessor(&source.indices, format!("{} indices", source.name));
         let primitive = json::mesh::Primitive {
             attributes,
@@ -385,6 +412,31 @@ impl Writer<'_> {
         Ok(Index::new((self.root.meshes.len() - 1) as u32))
     }
 
+    fn skin(&mut self, source: &SceneSkin) -> json::Skin {
+        let inverse_bind_matrices = (!source.inverse_bind_matrices.is_empty()).then(|| {
+            self.f32_accessor(
+                source.inverse_bind_matrices.iter().flatten().copied(),
+                source.inverse_bind_matrices.len(),
+                accessor::Type::Mat4,
+                None,
+                buffer::Target::ArrayBuffer,
+                format!("{} inverse bind matrices", source.name),
+            )
+        });
+        json::Skin {
+            extensions: None,
+            extras: Default::default(),
+            inverse_bind_matrices,
+            joints: source
+                .joints
+                .iter()
+                .map(|&index| Index::new(index as u32))
+                .collect(),
+            name: Some(source.name.clone()),
+            skeleton: source.skeleton.map(|index| Index::new(index as u32)),
+        }
+    }
+
     #[allow(clippy::needless_update)]
     fn material(&mut self, source: &SceneMaterial) -> Result<json::Material, GlbError> {
         let diffuse = source
@@ -395,6 +447,12 @@ impl Writer<'_> {
             .flatten();
         let normal = source
             .normal_texture
+            .as_deref()
+            .map(|path| self.texture(path))
+            .transpose()?
+            .flatten();
+        let specular = source
+            .specular_texture
             .as_deref()
             .map(|path| self.texture(path))
             .transpose()?
@@ -411,39 +469,55 @@ impl Writer<'_> {
             extensions: None,
             extras: Default::default(),
         };
-        let extensions = (source.unlit || source.emissive_multiplier > 1.0).then(|| {
-            if source.unlit
-                && !self
-                    .root
-                    .extensions_used
-                    .iter()
-                    .any(|value| value == "KHR_materials_unlit")
-            {
-                self.root.extensions_used.push("KHR_materials_unlit".into());
-            }
-            if source.emissive_multiplier > 1.0
-                && !self
-                    .root
-                    .extensions_used
-                    .iter()
-                    .any(|value| value == "KHR_materials_emissive_strength")
-            {
-                self.root
-                    .extensions_used
-                    .push("KHR_materials_emissive_strength".into());
-            }
-            json::extensions::material::Material {
-                unlit: source.unlit.then_some(json::extensions::material::Unlit {}),
-                emissive_strength: (source.emissive_multiplier > 1.0).then_some(
-                    json::extensions::material::EmissiveStrength {
-                        emissive_strength: json::extensions::material::EmissiveStrengthFactor(
-                            source.emissive_multiplier,
-                        ),
-                    },
-                ),
-                ..Default::default()
-            }
-        });
+        let extensions = (source.unlit || source.emissive_multiplier > 1.0 || specular.is_some())
+            .then(|| {
+                if source.unlit
+                    && !self
+                        .root
+                        .extensions_used
+                        .iter()
+                        .any(|value| value == "KHR_materials_unlit")
+                {
+                    self.root.extensions_used.push("KHR_materials_unlit".into());
+                }
+                if source.emissive_multiplier > 1.0
+                    && !self
+                        .root
+                        .extensions_used
+                        .iter()
+                        .any(|value| value == "KHR_materials_emissive_strength")
+                {
+                    self.root
+                        .extensions_used
+                        .push("KHR_materials_emissive_strength".into());
+                }
+                if specular.is_some()
+                    && !self
+                        .root
+                        .extensions_used
+                        .iter()
+                        .any(|value| value == "KHR_materials_specular")
+                {
+                    self.root
+                        .extensions_used
+                        .push("KHR_materials_specular".into());
+                }
+                json::extensions::material::Material {
+                    unlit: source.unlit.then_some(json::extensions::material::Unlit {}),
+                    emissive_strength: (source.emissive_multiplier > 1.0).then_some(
+                        json::extensions::material::EmissiveStrength {
+                            emissive_strength: json::extensions::material::EmissiveStrengthFactor(
+                                source.emissive_multiplier,
+                            ),
+                        },
+                    ),
+                    specular: specular.map(|index| json::extensions::material::Specular {
+                        specular_texture: Some(texture_info(index)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+            });
         Ok(json::Material {
             alpha_cutoff: source.alpha_cutoff.map(material::AlphaCutoff),
             alpha_mode: Valid(match source.alpha_mode {
@@ -565,6 +639,36 @@ impl Writer<'_> {
             type_: Valid(accessor::Type::Scalar),
             min: values.iter().min().map(|value| serde_json::json!([value])),
             max: values.iter().max().map(|value| serde_json::json!([value])),
+            name: None,
+            normalized: false,
+            sparse: None,
+        });
+        Index::new((self.root.accessors.len() - 1) as u32)
+    }
+
+    fn u16_vector_accessor(
+        &mut self,
+        values: impl IntoIterator<Item = u16>,
+        count: usize,
+        type_: accessor::Type,
+        target: buffer::Target,
+        name: String,
+    ) -> Index<json::Accessor> {
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let view = self.view(&bytes, Some(target), Some(name));
+        self.root.accessors.push(json::Accessor {
+            buffer_view: Some(view),
+            byte_offset: Some(USize64(0)),
+            count: count.into(),
+            component_type: Valid(accessor::GenericComponentType(accessor::ComponentType::U16)),
+            extensions: None,
+            extras: Default::default(),
+            type_: Valid(type_),
+            min: None,
+            max: None,
             name: None,
             normalized: false,
             sparse: None,
@@ -874,8 +978,10 @@ mod tests {
                 unlit: false,
                 diffuse_texture: Some(texture_path.into()),
                 normal_texture: None,
+                specular_texture: None,
                 glow_texture: None,
             }],
+            skins: Vec::new(),
             issues: Vec::new(),
             statistics: super::super::SceneStatistics::default(),
             animations: Vec::new(),
@@ -901,6 +1007,150 @@ mod tests {
             .expect("decode embedded PNG")
             .to_rgba8();
         assert!(image.pixels().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn encoded_glb_preserves_skin_joints_and_weights() {
+        let identity = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let transform = super::super::Transform {
+            translation: [0.0; 3],
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            scale: 1.0,
+        };
+        let scene = Scene {
+            nodes: vec![
+                super::super::SceneNode {
+                    source_block: 0,
+                    name: "Root".into(),
+                    transform,
+                    children: vec![1],
+                    mesh: None,
+                    skin: None,
+                },
+                super::super::SceneNode {
+                    source_block: 1,
+                    name: "Bone".into(),
+                    transform,
+                    children: vec![2],
+                    mesh: None,
+                    skin: None,
+                },
+                super::super::SceneNode {
+                    source_block: 2,
+                    name: "Skinned".into(),
+                    transform,
+                    children: Vec::new(),
+                    mesh: Some(SceneMesh {
+                        name: "Skinned".into(),
+                        positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                        normals: Vec::new(),
+                        tangents: Vec::new(),
+                        colors: Vec::new(),
+                        tex_coords: Vec::new(),
+                        joints: vec![[0, 0, 0, 0]; 3],
+                        weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+                        indices: vec![0, 1, 2],
+                        material: None,
+                    }),
+                    skin: Some(0),
+                },
+            ],
+            roots: vec![0],
+            materials: Vec::new(),
+            skins: vec![SceneSkin {
+                name: "Skin".into(),
+                joints: vec![1],
+                inverse_bind_matrices: vec![identity],
+                skeleton: Some(0),
+            }],
+            issues: Vec::new(),
+            statistics: super::super::SceneStatistics {
+                source_meshes: 1,
+                source_vertices: 3,
+                source_triangles: 1,
+            },
+            animations: Vec::new(),
+        };
+        let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
+            .expect("encode skinned GLB");
+        let gltf = gltf::Gltf::from_slice(&output.bytes).expect("validate skinned GLB");
+        let skin = gltf.document.skins().next().expect("skin");
+        assert_eq!(skin.joints().count(), 1);
+        let primitive = gltf
+            .document
+            .meshes()
+            .next()
+            .unwrap()
+            .primitives()
+            .next()
+            .unwrap();
+        assert!(primitive.get(&gltf::Semantic::Joints(0)).is_some());
+        assert!(primitive.get(&gltf::Semantic::Weights(0)).is_some());
+    }
+
+    #[test]
+    fn encoded_glb_preserves_xyzw_animation_rotations() {
+        let transform = super::super::Transform {
+            translation: [0.0; 3],
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            scale: 1.0,
+        };
+        let half_angle = std::f32::consts::FRAC_PI_4;
+        let expected = [0.0, 0.0, half_angle.sin(), half_angle.cos()];
+        let scene = Scene {
+            nodes: vec![super::super::SceneNode {
+                source_block: 0,
+                name: "Door".into(),
+                transform,
+                children: Vec::new(),
+                mesh: None,
+                skin: None,
+            }],
+            roots: vec![0],
+            materials: Vec::new(),
+            skins: Vec::new(),
+            issues: Vec::new(),
+            statistics: super::super::SceneStatistics::default(),
+            animations: vec![SceneAnimation {
+                name: "Open".into(),
+                start_time: 0.0,
+                stop_time: 1.0,
+                channels: vec![SceneAnimationChannel {
+                    node: 0,
+                    translations: Vec::new(),
+                    rotations: vec![super::super::AnimationKey {
+                        time: 0.0,
+                        value: expected,
+                    }],
+                    scales: Vec::new(),
+                }],
+            }],
+        };
+        let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
+            .expect("encode animated GLB");
+        let gltf = gltf::Gltf::from_slice(&output.bytes).expect("validate animated GLB");
+        let blob = gltf.blob.as_deref().expect("GLB binary chunk");
+        let channel = gltf
+            .document
+            .animations()
+            .next()
+            .expect("animation")
+            .channels()
+            .next()
+            .expect("rotation channel");
+        let reader = channel.reader(|_| Some(blob));
+        let gltf::animation::util::ReadOutputs::Rotations(rotations) =
+            reader.read_outputs().expect("rotation values")
+        else {
+            panic!("expected rotation output");
+        };
+        let values = rotations.into_f32().collect::<Vec<_>>();
+        assert_eq!(values.len(), 1);
+        for (actual, expected) in values[0].into_iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1.0e-6, "{actual} != {expected}");
+        }
     }
 
     #[test]

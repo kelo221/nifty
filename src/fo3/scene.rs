@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use glam::{EulerRot, Quat};
+use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use thiserror::Error;
 
 use super::{
     AlphaProperty, AnimationKey, AnimationKeyGroup, AvObject, Document, Geometry, GeometryData,
-    MaterialProperty, NoLightingProperty, Node, PpLightingProperty, ShaderTextureSet, Transform,
-    TransformData, TransformInterpolator, TriStripsData, TypedBlock,
+    MaterialProperty, NoLightingProperty, Node, PpLightingProperty, ShaderTextureSet, SkinData,
+    SkinInstance, SkinPartitionData, Transform, TransformData, TransformInterpolator,
+    TriStripsData, TypedBlock,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub struct SceneMaterial {
     pub unlit: bool,
     pub diffuse_texture: Option<String>,
     pub normal_texture: Option<String>,
+    pub specular_texture: Option<String>,
     pub glow_texture: Option<String>,
 }
 
@@ -40,6 +42,8 @@ pub struct SceneMesh {
     pub tangents: Vec<[f32; 4]>,
     pub colors: Vec<[f32; 4]>,
     pub tex_coords: Vec<[f32; 2]>,
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
     pub indices: Vec<u16>,
     pub material: Option<usize>,
 }
@@ -51,7 +55,18 @@ pub struct SceneNode {
     pub transform: Transform,
     pub children: Vec<usize>,
     pub mesh: Option<SceneMesh>,
+    pub skin: Option<usize>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneSkin {
+    pub name: String,
+    pub joints: Vec<usize>,
+    pub inverse_bind_matrices: Vec<[f32; 16]>,
+    pub skeleton: Option<usize>,
+}
+
+type VertexSkinInfluences = (Vec<[u16; 4]>, Vec<[f32; 4]>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneAnimation {
@@ -88,6 +103,7 @@ pub struct Scene {
     pub nodes: Vec<SceneNode>,
     pub roots: Vec<usize>,
     pub materials: Vec<SceneMaterial>,
+    pub skins: Vec<SceneSkin>,
     pub issues: Vec<SceneIssue>,
     pub statistics: SceneStatistics,
     pub animations: Vec<SceneAnimation>,
@@ -97,6 +113,262 @@ impl Scene {
     pub fn is_lossless(&self) -> bool {
         self.issues.is_empty()
     }
+
+    pub fn has_visible_geometry(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            node.mesh
+                .as_ref()
+                .is_some_and(|mesh| !mesh.positions.is_empty() && !mesh.indices.is_empty())
+        })
+    }
+
+    pub fn has_visible_weighted_geometry(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            node.skin.is_some()
+                && node.mesh.as_ref().is_some_and(|mesh| {
+                    !mesh.positions.is_empty()
+                        && !mesh.indices.is_empty()
+                        && mesh.joints.len() == mesh.positions.len()
+                        && mesh.weights.len() == mesh.positions.len()
+                })
+        })
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ActorSceneMergeError {
+    #[error("actor part skin joint {joint:?} is absent from the shared skeleton")]
+    MissingJoint { joint: String },
+    #[error("actor part skeleton root {root:?} is absent from the shared skeleton")]
+    MissingSkeletonRoot { root: String },
+    #[error("actor scene has an invalid rest transform at node {node:?}")]
+    InvalidRestTransform { node: String },
+}
+
+pub fn merge_actor_scene(actor: &mut Scene, part: &Scene) -> Result<(), ActorSceneMergeError> {
+    let mut merged = actor.clone();
+    merge_actor_scene_inner(&mut merged, part)?;
+    *actor = merged;
+    Ok(())
+}
+
+pub fn recalculate_actor_inverse_bind_matrices(
+    actor: &mut Scene,
+) -> Result<(), ActorSceneMergeError> {
+    let mut parents = vec![None; actor.nodes.len()];
+    for (parent, node) in actor.nodes.iter().enumerate() {
+        for &child in &node.children {
+            if let Some(slot) = parents.get_mut(child) {
+                *slot = Some(parent);
+            }
+        }
+    }
+    let mut globals = vec![None; actor.nodes.len()];
+    let mut visiting = HashSet::new();
+    for node in 0..actor.nodes.len() {
+        actor_global_transform(actor, &parents, &mut globals, &mut visiting, node)?;
+    }
+    for (skin_index, skin) in actor.skins.iter_mut().enumerate() {
+        let mesh_node = actor
+            .nodes
+            .iter()
+            .position(|node| node.skin == Some(skin_index))
+            .and_then(|node| globals[node])
+            .unwrap_or(Mat4::IDENTITY);
+        let mut inverse_bind_matrices = Vec::with_capacity(skin.joints.len());
+        for &joint in &skin.joints {
+            let Some(joint_global) = globals.get(joint).copied().flatten() else {
+                return Err(ActorSceneMergeError::InvalidRestTransform {
+                    node: format!("node#{joint}"),
+                });
+            };
+            let inverse_bind = joint_global.inverse() * mesh_node;
+            if !inverse_bind.is_finite() {
+                return Err(ActorSceneMergeError::InvalidRestTransform {
+                    node: actor.nodes[joint].name.clone(),
+                });
+            }
+            inverse_bind_matrices.push(inverse_bind.to_cols_array());
+        }
+        skin.inverse_bind_matrices = inverse_bind_matrices;
+    }
+    Ok(())
+}
+
+fn actor_global_transform(
+    actor: &Scene,
+    parents: &[Option<usize>],
+    globals: &mut [Option<Mat4>],
+    visiting: &mut HashSet<usize>,
+    node: usize,
+) -> Result<Mat4, ActorSceneMergeError> {
+    if let Some(global) = globals.get(node).copied().flatten() {
+        return Ok(global);
+    }
+    if !visiting.insert(node) {
+        return Err(ActorSceneMergeError::InvalidRestTransform {
+            node: actor
+                .nodes
+                .get(node)
+                .map(|node| node.name.clone())
+                .unwrap_or_else(|| format!("node#{node}")),
+        });
+    }
+    let local = actor
+        .nodes
+        .get(node)
+        .map(|node| Mat4::from_cols_array(&transform_matrix(&node.transform)))
+        .ok_or_else(|| ActorSceneMergeError::InvalidRestTransform {
+            node: format!("node#{node}"),
+        })?;
+    let global = if let Some(parent) = parents.get(node).copied().flatten() {
+        actor_global_transform(actor, parents, globals, visiting, parent)? * local
+    } else {
+        local
+    };
+    visiting.remove(&node);
+    if !global.is_finite() {
+        return Err(ActorSceneMergeError::InvalidRestTransform {
+            node: actor.nodes[node].name.clone(),
+        });
+    }
+    globals[node] = Some(global);
+    Ok(global)
+}
+
+fn merge_actor_scene_inner(actor: &mut Scene, part: &Scene) -> Result<(), ActorSceneMergeError> {
+    let shared_node_count = actor.nodes.len();
+    let material_offset = actor.materials.len();
+    actor.materials.extend(part.materials.iter().cloned());
+
+    let mut reusable = HashMap::<String, usize>::new();
+    for (index, node) in actor.nodes.iter().enumerate() {
+        if node.mesh.is_none() {
+            reusable.entry(actor_node_key(&node.name)).or_insert(index);
+        }
+    }
+    let mut node_map = vec![usize::MAX; part.nodes.len()];
+    let mut appended_part_nodes = vec![false; part.nodes.len()];
+    let mut appended = Vec::new();
+    for (index, node) in part.nodes.iter().enumerate() {
+        if node.mesh.is_none() {
+            if let Some(&existing) = reusable.get(&actor_node_key(&node.name)) {
+                node_map[index] = existing;
+                continue;
+            }
+        }
+        node_map[index] = actor.nodes.len();
+        appended_part_nodes[index] = true;
+        appended.push((index, actor.nodes.len()));
+        let mut node = node.clone();
+        node.children.clear();
+        node.skin = None;
+        if let Some(mesh) = &mut node.mesh {
+            if let Some(material) = &mut mesh.material {
+                *material += material_offset;
+            }
+        }
+        actor.nodes.push(node);
+    }
+
+    let skin_offset = actor.skins.len();
+    for skin in &part.skins {
+        let mut remapped = skin.clone();
+        remapped.joints = skin
+            .joints
+            .iter()
+            .map(|&joint| {
+                node_map
+                    .get(joint)
+                    .copied()
+                    .filter(|&node| node < shared_node_count)
+                    .ok_or_else(|| ActorSceneMergeError::MissingJoint {
+                        joint: part
+                            .nodes
+                            .get(joint)
+                            .map(|node| node.name.clone())
+                            .unwrap_or_else(|| format!("node#{joint}")),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        remapped.skeleton = skin
+            .skeleton
+            .map(|root| {
+                node_map
+                    .get(root)
+                    .copied()
+                    .filter(|&node| node < shared_node_count)
+                    .ok_or_else(|| ActorSceneMergeError::MissingSkeletonRoot {
+                        root: part
+                            .nodes
+                            .get(root)
+                            .map(|node| node.name.clone())
+                            .unwrap_or_else(|| format!("node#{root}")),
+                    })
+            })
+            .transpose()?;
+        actor.skins.push(remapped);
+    }
+
+    for (part_index, actor_index) in appended {
+        actor.nodes[actor_index].children = part.nodes[part_index]
+            .children
+            .iter()
+            .filter(|&&child| appended_part_nodes.get(child).copied().unwrap_or(false))
+            .filter_map(|&child| node_map.get(child).copied())
+            .filter(|&child| child != usize::MAX)
+            .collect();
+        actor.nodes[actor_index].skin = part.nodes[part_index].skin.map(|skin| skin + skin_offset);
+    }
+    for (part_index, node) in part.nodes.iter().enumerate() {
+        let actor_index = node_map[part_index];
+        if actor_index >= actor.nodes.len() || actor.nodes[actor_index].mesh.is_some() {
+            continue;
+        }
+        for &child in &node.children {
+            if !appended_part_nodes.get(child).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(&child) = node_map.get(child) {
+                if child != usize::MAX && !actor.nodes[actor_index].children.contains(&child) {
+                    actor.nodes[actor_index].children.push(child);
+                }
+            }
+        }
+    }
+    for &root in &part.roots {
+        if !appended_part_nodes.get(root).copied().unwrap_or(false) {
+            continue;
+        }
+        if let Some(&root) = node_map.get(root) {
+            if root != usize::MAX
+                && !actor.roots.contains(&root)
+                && !actor.nodes.iter().any(|node| node.children.contains(&root))
+            {
+                actor.roots.push(root);
+            }
+        }
+    }
+    actor.issues.extend(part.issues.iter().cloned());
+    actor.statistics.source_meshes += part.statistics.source_meshes;
+    actor.statistics.source_vertices += part.statistics.source_vertices;
+    actor.statistics.source_triangles += part.statistics.source_triangles;
+    Ok(())
+}
+
+fn actor_node_key(name: &str) -> String {
+    let mut parts = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let side = (parts.len() >= 3 && parts.first().is_some_and(|part| part.starts_with("bip")))
+        .then(|| parts.pop_if(|part| part == "l" || part == "r"))
+        .flatten();
+    if let Some(side) = side {
+        parts.insert(1, side);
+    }
+    parts.concat()
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -125,6 +397,7 @@ pub fn extract_scene(document: &Document) -> Result<Scene, SceneError> {
             nodes: Vec::new(),
             roots: Vec::new(),
             materials: Vec::new(),
+            skins: Vec::new(),
             issues: Vec::new(),
             statistics: SceneStatistics::default(),
             animations: Vec::new(),
@@ -310,11 +583,15 @@ fn merge_animation_channel(
     data: TransformData,
 ) {
     let TransformData {
-        mut rotations,
+        rotations: nif_wxyz_rotations,
         xyz_rotations,
         translations,
         scales,
     } = data;
+    let mut rotations = nif_wxyz_rotations
+        .into_iter()
+        .map(nif_wxyz_rotation_key_to_gltf_xyzw)
+        .collect::<Vec<_>>();
     if let Some(xyz_rotations) = xyz_rotations {
         rotations.extend(xyz_rotation_keys(&xyz_rotations));
     }
@@ -325,25 +602,28 @@ fn merge_animation_channel(
         channels.push(SceneAnimationChannel {
             node,
             translations: translations.keys,
-            rotations: rotations
-                .into_iter()
-                .map(|key| AnimationKey {
-                    time: key.time,
-                    value: [key.value[1], key.value[2], key.value[3], key.value[0]],
-                })
-                .collect(),
+            rotations,
             scales: scales.keys,
         });
         return;
     };
     channel.translations.extend(translations.keys);
-    channel
-        .rotations
-        .extend(rotations.into_iter().map(|key| AnimationKey {
-            time: key.time,
-            value: [key.value[1], key.value[2], key.value[3], key.value[0]],
-        }));
+    channel.rotations.extend(rotations);
     channel.scales.extend(scales.keys);
+}
+
+/// Converts the NIF quaternion convention (WXYZ) to glTF's XYZW convention.
+///
+/// XYZ Euler tracks are constructed with `glam::Quat` and already use XYZW,
+/// so they must bypass this source-format conversion.
+fn nif_wxyz_rotation_key_to_gltf_xyzw(
+    key: AnimationKey<[f32; 4]>,
+) -> AnimationKey<[f32; 4]> {
+    let [w, x, y, z] = key.value;
+    AnimationKey {
+        time: key.time,
+        value: [x, y, z, w],
+    }
 }
 
 fn xyz_rotation_keys(groups: &[AnimationKeyGroup<f32>; 3]) -> Vec<AnimationKey<[f32; 4]>> {
@@ -476,16 +756,9 @@ impl SceneBuilder<'_> {
         block_index: usize,
         geometry: Geometry,
     ) -> Result<Option<usize>, SceneError> {
-        if geometry.skin_instance >= 0 {
-            self.issue(
-                block_index,
-                "skinned geometry is deferred until the actor milestone".into(),
-            );
-            return Ok(None);
-        }
         let data_index = self.reference(block_index, geometry.data, "geometry data")?;
         let data_type = self.document.blocks[data_index].type_name.clone();
-        let (data, triangles) = match self.decode(data_index)? {
+        let (data, mut triangles) = match self.decode(data_index)? {
             TypedBlock::TriShapeData(data) => {
                 let triangles = data.triangles.clone();
                 (data.geometry, triangles)
@@ -506,8 +779,90 @@ impl SceneBuilder<'_> {
             self.issue(data_index, "geometry has no renderable triangles".into());
             return Ok(None);
         }
-        let indices = triangles.into_iter().flatten().collect::<Vec<_>>();
         let vertex_count = data.vertices.len();
+        let mut skin = None;
+        let (joints, weights) = if geometry.skin_instance >= 0 {
+            let skin_index =
+                self.reference(block_index, geometry.skin_instance, "skin instance")?;
+            let instance = match self.decode(skin_index)? {
+                TypedBlock::SkinInstance(instance) => instance,
+                _ => {
+                    self.issue(skin_index, "skin instance has an unsupported type".into());
+                    return Ok(None);
+                }
+            };
+            let skin_data_index = self.reference(skin_index, instance.data, "skin data")?;
+            let skin_data = match self.decode(skin_data_index)? {
+                TypedBlock::SkinData(data) => data,
+                _ => {
+                    self.issue(skin_data_index, "skin data has an unsupported type".into());
+                    return Ok(None);
+                }
+            };
+            if instance.bones.len() != skin_data.bones.len() {
+                self.issue(
+                    skin_index,
+                    format!(
+                        "skin instance has {} bone references but skin data has {} bones",
+                        instance.bones.len(),
+                        skin_data.bones.len()
+                    ),
+                );
+                return Ok(None);
+            }
+            if instance.skin_partition >= 0 {
+                let partition_index =
+                    self.reference(skin_index, instance.skin_partition, "skin partition")?;
+                if let TypedBlock::SkinPartitionData(partitions) = self.decode(partition_index)? {
+                    triangles = visible_partition_triangles(&partitions, &instance, vertex_count);
+                    if triangles.is_empty() {
+                        self.issue(
+                            block_index,
+                            "skinned geometry has no editor-visible partitions".into(),
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            let Some((joints, weights)) = skin_vertex_influences(vertex_count, &skin_data) else {
+                self.issue(skin_data_index, "skin has no usable vertex weights".into());
+                return Ok(None);
+            };
+            let mut joint_nodes = Vec::with_capacity(instance.bones.len());
+            for &bone in &instance.bones {
+                let bone_index = self.reference(skin_index, bone, "skin bone")?;
+                let Some(node) = self.visit(bone_index)? else {
+                    self.issue(bone_index, "skin bone is not a scene node".into());
+                    return Ok(None);
+                };
+                joint_nodes.push(node);
+            }
+            let skeleton = if instance.skeleton_root >= 0 {
+                let root = self.reference(skin_index, instance.skeleton_root, "skeleton root")?;
+                self.visit(root)?
+            } else {
+                None
+            };
+            let skin_scene_index = self.scene.skins.len();
+            self.scene.skins.push(SceneSkin {
+                name: format!(
+                    "{} Skin",
+                    geometry.base.object.name.as_deref().unwrap_or("Mesh")
+                ),
+                joints: joint_nodes,
+                inverse_bind_matrices: skin_data
+                    .bones
+                    .iter()
+                    .map(|bone| transform_matrix(&bone.skin_transform))
+                    .collect(),
+                skeleton,
+            });
+            skin = Some(skin_scene_index);
+            (joints, weights)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let indices = triangles.into_iter().flatten().collect::<Vec<_>>();
         if indices.iter().any(|&index| index as usize >= vertex_count) {
             self.issue(
                 data_index,
@@ -535,17 +890,17 @@ impl SceneBuilder<'_> {
                 .next()
                 .filter(|values| values.len() == vertex_count)
                 .unwrap_or_default(),
+            joints,
+            weights,
             indices,
             material,
         };
         self.scene.statistics.source_meshes += 1;
         self.scene.statistics.source_vertices += mesh.positions.len();
         self.scene.statistics.source_triangles += mesh.indices.len() / 3;
-        Ok(Some(self.push_node(
-            block_index,
-            &geometry.base,
-            Some(mesh),
-        )))
+        let node = self.push_node(block_index, &geometry.base, Some(mesh));
+        self.scene.nodes[node].skin = skin;
+        Ok(Some(node))
     }
 
     fn extract_material(
@@ -627,6 +982,7 @@ impl SceneBuilder<'_> {
             transform: object.transform,
             children: Vec::new(),
             mesh,
+            skin: None,
         });
         self.node_by_block.insert(block_index, scene_index);
         scene_index
@@ -690,6 +1046,99 @@ impl SceneBuilder<'_> {
             message,
         });
     }
+}
+
+const PF_EDITOR_VISIBLE: u16 = 0x0001;
+
+fn visible_partition_triangles(
+    partitions: &SkinPartitionData,
+    instance: &SkinInstance,
+    vertex_count: usize,
+) -> Vec<[u16; 3]> {
+    let has_dismember_metadata = !instance.partitions.is_empty();
+    partitions
+        .partitions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            !has_dismember_metadata
+                || instance
+                    .partitions
+                    .get(*index)
+                    .is_some_and(|partition| partition.flags & PF_EDITOR_VISIBLE != 0)
+        })
+        .flat_map(|(_, partition)| {
+            partition.triangles.iter().filter_map(|triangle| {
+                let mapped = triangle.map(|index| {
+                    partition
+                        .vertex_map
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(index)
+                });
+                mapped
+                    .iter()
+                    .all(|&index| (index as usize) < vertex_count)
+                    .then_some(mapped)
+            })
+        })
+        .collect()
+}
+
+fn skin_vertex_influences(
+    vertex_count: usize,
+    skin_data: &SkinData,
+) -> Option<VertexSkinInfluences> {
+    let mut influences = vec![Vec::<(u16, f32)>::new(); vertex_count];
+    for (bone_index, bone) in skin_data.bones.iter().enumerate() {
+        let bone_index = u16::try_from(bone_index).ok()?;
+        for &(vertex, weight) in &bone.vertex_weights {
+            if weight.is_finite() && weight > 0.0 {
+                if let Some(vertex_influences) = influences.get_mut(vertex as usize) {
+                    vertex_influences.push((bone_index, weight));
+                }
+            }
+        }
+    }
+    if influences.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let mut joints = Vec::with_capacity(vertex_count);
+    let mut weights = Vec::with_capacity(vertex_count);
+    for mut vertex in influences {
+        vertex.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        vertex.truncate(4);
+        let total = vertex.iter().map(|(_, weight)| *weight).sum::<f32>();
+        if total <= f32::EPSILON {
+            return None;
+        }
+        let mut vertex_joints = [0; 4];
+        let mut vertex_weights = [0.0; 4];
+        for (slot, (joint, weight)) in vertex.into_iter().enumerate() {
+            vertex_joints[slot] = joint;
+            vertex_weights[slot] = weight / total;
+        }
+        joints.push(vertex_joints);
+        weights.push(vertex_weights);
+    }
+    Some((joints, weights))
+}
+
+fn transform_matrix(transform: &Transform) -> [f32; 16] {
+    let rotation =
+        Quat::from_mat3(&Mat3::from_cols_array(&transform.rotation).transpose()).normalize();
+    Mat4::from_scale_rotation_translation(
+        Vec3::splat(transform.scale),
+        rotation,
+        Vec3::from_array(transform.translation),
+    )
+    .to_cols_array()
 }
 
 fn exact_attribute<T>(values: Vec<T>, vertex_count: usize) -> Vec<T> {
@@ -782,9 +1231,7 @@ fn make_material(
         base_color: [1.0, 1.0, 1.0, alpha_value],
         emissive: material.map_or([0.0; 3], |value| value.emissive),
         emissive_multiplier: material.map_or(1.0, |value| value.emissive_multiplier.max(0.0)),
-        roughness: material.map_or(1.0, |value| {
-            (1.0 - value.glossiness / 100.0).clamp(0.0, 1.0)
-        }),
+        roughness: material_roughness_policy(material.map(|value| value.glossiness)),
         alpha_mode,
         alpha_cutoff,
         double_sided: false,
@@ -794,8 +1241,13 @@ fn make_material(
             .filter(|path| !path.is_empty())
             .or_else(|| texture(0)),
         normal_texture: texture(1),
+        specular_texture: texture(1),
         glow_texture: texture(2),
     }
+}
+
+fn material_roughness_policy(_glossiness: Option<f32>) -> f32 {
+    0.5
 }
 
 fn alpha_policy(alpha: Option<(u16, u8)>, material_alpha: f32) -> (SceneAlphaMode, Option<f32>) {
@@ -819,6 +1271,127 @@ pub fn normalize_texture_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scalar_keys(values: &[(f32, f32)]) -> AnimationKeyGroup<f32> {
+        AnimationKeyGroup {
+            interpolation: Some(super::super::KeyType::Linear),
+            keys: values
+                .iter()
+                .map(|&(time, value)| AnimationKey { time, value })
+                .collect(),
+        }
+    }
+
+    fn empty_vec3_keys() -> AnimationKeyGroup<[f32; 3]> {
+        AnimationKeyGroup {
+            interpolation: None,
+            keys: Vec::new(),
+        }
+    }
+
+    fn empty_scalar_keys() -> AnimationKeyGroup<f32> {
+        AnimationKeyGroup {
+            interpolation: None,
+            keys: Vec::new(),
+        }
+    }
+
+    fn assert_quaternion_close(actual: [f32; 4], expected: [f32; 4]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1.0e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn zero_xyz_rotation_is_identity_xyzw() {
+        let groups = [
+            scalar_keys(&[(0.0, 0.0)]),
+            scalar_keys(&[(0.0, 0.0)]),
+            scalar_keys(&[(0.0, 0.0)]),
+        ];
+        let rotations = xyz_rotation_keys(&groups);
+        assert_eq!(rotations.len(), 1);
+        assert_quaternion_close(rotations[0].value, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn ninety_degree_z_xyz_rotation_is_xyzw() {
+        let groups = [
+            scalar_keys(&[(0.0, 0.0)]),
+            scalar_keys(&[(0.0, 0.0)]),
+            scalar_keys(&[(0.0, std::f32::consts::FRAC_PI_2)]),
+        ];
+        let rotations = xyz_rotation_keys(&groups);
+        let half_angle = std::f32::consts::FRAC_PI_4;
+        assert_quaternion_close(
+            rotations[0].value,
+            [0.0, 0.0, half_angle.sin(), half_angle.cos()],
+        );
+    }
+
+    #[test]
+    fn mixed_xyz_rotation_matches_glam_xyzw() {
+        let angles = [0.25, -0.5, 0.75];
+        let groups = [
+            scalar_keys(&[(0.0, angles[0])]),
+            scalar_keys(&[(0.0, angles[1])]),
+            scalar_keys(&[(0.0, angles[2])]),
+        ];
+        let rotations = xyz_rotation_keys(&groups);
+        assert_quaternion_close(
+            rotations[0].value,
+            Quat::from_euler(EulerRot::XYZ, angles[0], angles[1], angles[2]).to_array(),
+        );
+    }
+
+    #[test]
+    fn nif_wxyz_rotation_is_reordered_exactly_once() {
+        let converted = nif_wxyz_rotation_key_to_gltf_xyzw(AnimationKey {
+            time: 0.0,
+            value: [0.5, 0.1, 0.2, 0.3],
+        });
+        assert_eq!(converted.value, [0.1, 0.2, 0.3, 0.5]);
+    }
+
+    #[test]
+    fn quaternion_and_xyz_controller_sources_merge_to_same_xyzw_rotation() {
+        let half_angle = std::f32::consts::FRAC_PI_4;
+        let quaternion_data = TransformData {
+            rotations: vec![AnimationKey {
+                time: 0.0,
+                value: [half_angle.cos(), 0.0, 0.0, half_angle.sin()],
+            }],
+            xyz_rotations: None,
+            translations: empty_vec3_keys(),
+            scales: empty_scalar_keys(),
+        };
+        let xyz_data = TransformData {
+            rotations: Vec::new(),
+            xyz_rotations: Some([
+                scalar_keys(&[(0.0, 0.0)]),
+                scalar_keys(&[(0.0, 0.0)]),
+                scalar_keys(&[(0.0, std::f32::consts::FRAC_PI_2)]),
+            ]),
+            translations: empty_vec3_keys(),
+            scales: empty_scalar_keys(),
+        };
+        let mut quaternion_channels = Vec::new();
+        merge_animation_channel(&mut quaternion_channels, 7, quaternion_data);
+        let mut xyz_channels = Vec::new();
+        merge_animation_channel(&mut xyz_channels, 7, xyz_data);
+        assert_quaternion_close(
+            quaternion_channels[0].rotations[0].value,
+            xyz_channels[0].rotations[0].value,
+        );
+    }
+
+    #[test]
+    fn material_roughness_matches_the_blender_converter_baseline() {
+        assert_eq!(material_roughness_policy(None), 0.5);
+        assert_eq!(material_roughness_policy(Some(0.0)), 0.5);
+        assert_eq!(material_roughness_policy(Some(70.0)), 0.5);
+        assert_eq!(material_roughness_policy(Some(100.0)), 0.5);
+    }
 
     #[test]
     fn alpha_policy_prefers_blend_when_blend_and_test_are_both_authored() {
