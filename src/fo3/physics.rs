@@ -124,7 +124,100 @@ pub enum PhysicsShape {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicsScene {
     pub bodies: Vec<PhysicsBody>,
+    pub joints: Vec<PhysicsJoint>,
     pub issues: Vec<PhysicsIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicsJoint {
+    pub source_block: usize,
+    pub kind: String,
+    pub body_a: u32,
+    pub body_b: u32,
+    pub anchor_a: [f32; 3],
+    pub anchor_b: [f32; 3],
+    pub frame_a_rotation_xyzw: [f32; 4],
+    pub frame_b_rotation_xyzw: [f32; 4],
+    pub lower_limit: Option<f32>,
+    pub upper_limit: Option<f32>,
+    pub cone_limit: Option<f32>,
+    pub plane_lower_limit: Option<f32>,
+    pub plane_upper_limit: Option<f32>,
+    pub twist_lower_limit: Option<f32>,
+    pub twist_upper_limit: Option<f32>,
+    pub malleable_strength: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Constraint {
+    pub entity_a: i32,
+    pub entity_b: i32,
+    pub data: ConstraintData,
+    pub malleable_strength: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstraintData {
+    Ragdoll(RagdollConstraint),
+    LimitedHinge(LimitedHingeConstraint),
+    Hinge(HingeConstraint),
+    BallAndSocket(BallAndSocketConstraint),
+    Prismatic(PrismaticConstraint),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RagdollConstraint {
+    pub twist_a: [f32; 4],
+    pub plane_a: [f32; 4],
+    pub pivot_a: [f32; 4],
+    pub twist_b: [f32; 4],
+    pub plane_b: [f32; 4],
+    pub pivot_b: [f32; 4],
+    pub cone_max_angle: f32,
+    pub plane_min_angle: f32,
+    pub plane_max_angle: f32,
+    pub twist_min_angle: f32,
+    pub twist_max_angle: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitedHingeConstraint {
+    pub axis_a: [f32; 4],
+    pub perpendicular_a: [f32; 4],
+    pub pivot_a: [f32; 4],
+    pub axis_b: [f32; 4],
+    pub perpendicular_b: [f32; 4],
+    pub pivot_b: [f32; 4],
+    pub min_angle: f32,
+    pub max_angle: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HingeConstraint {
+    pub axis_a: [f32; 4],
+    pub perpendicular_a: [f32; 4],
+    pub pivot_a: [f32; 4],
+    pub axis_b: [f32; 4],
+    pub perpendicular_b: [f32; 4],
+    pub pivot_b: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BallAndSocketConstraint {
+    pub pivot_a: [f32; 4],
+    pub pivot_b: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrismaticConstraint {
+    pub sliding_a: [f32; 4],
+    pub rotation_a: [f32; 4],
+    pub pivot_a: [f32; 4],
+    pub sliding_b: [f32; 4],
+    pub rotation_b: [f32; 4],
+    pub pivot_b: [f32; 4],
+    pub min_distance: f32,
+    pub max_distance: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,9 +301,11 @@ pub fn extract_physics(document: &Document) -> Result<PhysicsScene, PhysicsError
     let mut world_cache = HashMap::new();
     let mut scene = PhysicsScene {
         bodies: Vec::new(),
+        joints: Vec::new(),
         issues: Vec::new(),
     };
     let mut seen_bodies = HashSet::new();
+    let mut body_frames = HashMap::new();
 
     for index in 0..document.blocks.len() {
         let collision = match decode(document, index)? {
@@ -266,6 +361,7 @@ pub fn extract_physics(document: &Document) -> Result<PhysicsScene, PhysicsError
                         "rigid body produced no supported collision shapes".into(),
                     );
                 }
+                body_frames.insert(body_index, (group_id, body_transform));
                 scene.bodies.push(PhysicsBody {
                     source_block: body_index,
                     group_id,
@@ -273,7 +369,7 @@ pub fn extract_physics(document: &Document) -> Result<PhysicsScene, PhysicsError
                     motion_type: motion_system_name(body.motion_system).into(),
                     quality_type: quality_type_name(body.quality_type).into(),
                     mass: body.mass,
-                    center_of_mass: basis_scaled(vec3(body.center), HAVOK_TO_METRES),
+                    center_of_mass: rigid_body_point(body.center, body_transform),
                     inertia: convert_inertia(body.inertia),
                     linear_velocity: basis_scaled(vec3(body.linear_velocity), HAVOK_TO_METRES),
                     angular_velocity: basis_scaled(vec3(body.angular_velocity), 1.0),
@@ -343,7 +439,164 @@ pub fn extract_physics(document: &Document) -> Result<PhysicsScene, PhysicsError
             ),
         }
     }
+    for index in 0..document.blocks.len() {
+        let constraint = match decode(document, index)? {
+            TypedBlock::Constraint(value) => value,
+            _ => continue,
+        };
+        let Some(&(body_a, frame_a)) = usize::try_from(constraint.entity_a)
+            .ok()
+            .and_then(|entity| body_frames.get(&entity))
+        else {
+            issue(
+                document,
+                &mut scene.issues,
+                index,
+                format!(
+                    "constraint entity A {} is not an extracted rigid body",
+                    constraint.entity_a
+                ),
+            );
+            continue;
+        };
+        let Some(&(body_b, frame_b)) = usize::try_from(constraint.entity_b)
+            .ok()
+            .and_then(|entity| body_frames.get(&entity))
+        else {
+            issue(
+                document,
+                &mut scene.issues,
+                index,
+                format!(
+                    "constraint entity B {} is not an extracted rigid body",
+                    constraint.entity_b
+                ),
+            );
+            continue;
+        };
+        if let Some(joint) = convert_constraint(index, body_a, body_b, frame_a, frame_b, constraint)
+        {
+            scene.joints.push(joint);
+        }
+    }
     Ok(scene)
+}
+
+fn convert_constraint(
+    source_block: usize,
+    body_a: u32,
+    body_b: u32,
+    body_frame_a: Mat4,
+    body_frame_b: Mat4,
+    constraint: Constraint,
+) -> Option<PhysicsJoint> {
+    let mut joint = PhysicsJoint {
+        source_block,
+        kind: "spherical".into(),
+        body_a,
+        body_b,
+        anchor_a: [0.0; 3],
+        anchor_b: [0.0; 3],
+        frame_a_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        frame_b_rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        lower_limit: None,
+        upper_limit: None,
+        cone_limit: None,
+        plane_lower_limit: None,
+        plane_upper_limit: None,
+        twist_lower_limit: None,
+        twist_upper_limit: None,
+        malleable_strength: constraint.malleable_strength,
+    };
+    match constraint.data {
+        ConstraintData::Ragdoll(value) => {
+            joint.anchor_a = constraint_point(value.pivot_a, body_frame_a);
+            joint.anchor_b = constraint_point(value.pivot_b, body_frame_b);
+            joint.frame_a_rotation_xyzw =
+                constraint_frame(value.twist_a, value.plane_a, body_frame_a)?;
+            joint.frame_b_rotation_xyzw =
+                constraint_frame(value.twist_b, value.plane_b, body_frame_b)?;
+            joint.cone_limit = Some(value.cone_max_angle);
+            joint.plane_lower_limit = Some(value.plane_min_angle);
+            joint.plane_upper_limit = Some(value.plane_max_angle);
+            joint.twist_lower_limit = Some(value.twist_min_angle);
+            joint.twist_upper_limit = Some(value.twist_max_angle);
+        }
+        ConstraintData::LimitedHinge(value) => {
+            joint.kind = "revolute".into();
+            joint.anchor_a = constraint_point(value.pivot_a, body_frame_a);
+            joint.anchor_b = constraint_point(value.pivot_b, body_frame_b);
+            joint.frame_a_rotation_xyzw =
+                constraint_frame(value.axis_a, value.perpendicular_a, body_frame_a)?;
+            joint.frame_b_rotation_xyzw =
+                constraint_frame(value.axis_b, value.perpendicular_b, body_frame_b)?;
+            joint.lower_limit = Some(value.min_angle);
+            joint.upper_limit = Some(value.max_angle);
+        }
+        ConstraintData::Hinge(value) => {
+            joint.kind = "revolute".into();
+            joint.anchor_a = constraint_point(value.pivot_a, body_frame_a);
+            joint.anchor_b = constraint_point(value.pivot_b, body_frame_b);
+            joint.frame_a_rotation_xyzw =
+                constraint_frame(value.axis_a, value.perpendicular_a, body_frame_a)?;
+            joint.frame_b_rotation_xyzw =
+                constraint_frame(value.axis_b, value.perpendicular_b, body_frame_b)?;
+        }
+        ConstraintData::BallAndSocket(value) => {
+            joint.anchor_a = constraint_point(value.pivot_a, body_frame_a);
+            joint.anchor_b = constraint_point(value.pivot_b, body_frame_b);
+        }
+        ConstraintData::Prismatic(value) => {
+            joint.kind = "prismatic".into();
+            joint.anchor_a = constraint_point(value.pivot_a, body_frame_a);
+            joint.anchor_b = constraint_point(value.pivot_b, body_frame_b);
+            joint.frame_a_rotation_xyzw =
+                constraint_frame(value.sliding_a, value.rotation_a, body_frame_a)?;
+            joint.frame_b_rotation_xyzw =
+                constraint_frame(value.sliding_b, value.rotation_b, body_frame_b)?;
+            joint.lower_limit = Some(value.min_distance * HAVOK_TO_METRES);
+            joint.upper_limit = Some(value.max_distance * HAVOK_TO_METRES);
+        }
+    }
+    let separation = Vec3::from_array(joint.anchor_a).distance(Vec3::from_array(joint.anchor_b));
+    (separation.is_finite() && separation <= 0.05).then_some(joint)
+}
+
+fn constraint_point(value: [f32; 4], body_frame: Mat4) -> [f32; 3] {
+    rigid_body_point(value, body_frame)
+}
+
+fn rigid_body_point(value: [f32; 4], body_frame: Mat4) -> [f32; 3] {
+    basis(body_frame.transform_point3(vec3(value) * HAVOK_TO_METRES))
+}
+
+fn constraint_frame(axis: [f32; 4], reference: [f32; 4], body_frame: Mat4) -> Option<[f32; 4]> {
+    let axis = Vec3::from_array(basis(body_frame.transform_vector3(vec3(axis))));
+    let reference = Vec3::from_array(basis(body_frame.transform_vector3(vec3(reference))));
+    joint_frame_quaternion(axis, reference)
+}
+
+fn joint_frame_quaternion(axis_z: Vec3, reference_x: Vec3) -> Option<[f32; 4]> {
+    if !axis_z.is_finite() || !reference_x.is_finite() || axis_z.length_squared() < 1.0e-10 {
+        return None;
+    }
+    let z = axis_z.normalize();
+    let projected_x = reference_x - z * reference_x.dot(z);
+    if projected_x.length_squared() < 1.0e-10 {
+        return None;
+    }
+    let mut x = projected_x.normalize();
+    let y = z.cross(x).normalize();
+    x = y.cross(z).normalize();
+    let mut frame = Quat::from_mat3(&Mat3::from_cols(x, y, z))
+        .normalize()
+        .to_array();
+    if frame[3] < 0.0 {
+        for component in &mut frame {
+            *component = -*component;
+        }
+    }
+    Some(frame)
 }
 
 fn collect_shapes(
@@ -791,6 +1044,14 @@ pub(crate) fn decode_physics_block(
         "bhkRigidBody" | "bhkRigidBodyT" => {
             parse_rigid_body(block, reader).map(TypedBlock::RigidBody)
         }
+        "bhkRagdollConstraint"
+        | "bhkLimitedHingeConstraint"
+        | "bhkHingeConstraint"
+        | "bhkBallAndSocketConstraint"
+        | "bhkPrismaticConstraint"
+        | "bhkMalleableConstraint" => {
+            parse_constraint_block(block, reader).map(TypedBlock::Constraint)
+        }
         "bhkSimpleShapePhantom" => {
             parse_simple_shape_phantom(block, reader).map(TypedBlock::SimpleShapePhantom)
         }
@@ -908,6 +1169,171 @@ fn parse_rigid_body(block: &RawBlock, reader: &mut Reader<'_>) -> Result<RigidBo
         body_flags,
         transformed: block.type_name == "bhkRigidBodyT",
     })
+}
+
+fn parse_constraint_block(
+    block: &RawBlock,
+    reader: &mut Reader<'_>,
+) -> Result<Constraint, Fo3Error> {
+    let outer = read_constraint_info(reader)?;
+    let (data, malleable_strength) = match block.type_name.as_str() {
+        "bhkRagdollConstraint" => (parse_ragdoll_constraint(reader)?, None),
+        "bhkLimitedHingeConstraint" => (parse_limited_hinge_constraint(reader)?, None),
+        "bhkHingeConstraint" => (parse_hinge_constraint(reader)?, None),
+        "bhkBallAndSocketConstraint" => (parse_ball_and_socket_constraint(reader)?, None),
+        "bhkPrismaticConstraint" => (parse_prismatic_constraint(reader)?, None),
+        "bhkMalleableConstraint" => {
+            let constraint_type = reader.read_u32("malleable constraint type")?;
+            let _nested = read_constraint_info(reader)?;
+            let data = match constraint_type {
+                0 => parse_ball_and_socket_constraint(reader)?,
+                1 => parse_hinge_constraint(reader)?,
+                2 => parse_limited_hinge_constraint(reader)?,
+                6 => parse_prismatic_constraint(reader)?,
+                7 => parse_ragdoll_constraint(reader)?,
+                value => {
+                    return Err(Fo3Error::InvalidEnum {
+                        field: "malleable constraint type",
+                        value,
+                    });
+                }
+            };
+            (data, Some(reader.read_f32("malleable strength")?))
+        }
+        _ => unreachable!("constraint parser is only dispatched for known constraint blocks"),
+    };
+    Ok(Constraint {
+        entity_a: outer.0,
+        entity_b: outer.1,
+        data,
+        malleable_strength,
+    })
+}
+
+fn read_constraint_info(reader: &mut Reader<'_>) -> Result<(i32, i32), Fo3Error> {
+    reader.read_u32("constraint entity count")?;
+    let entity_a = reader.read_i32("constraint entity A")?;
+    let entity_b = reader.read_i32("constraint entity B")?;
+    reader.read_u32("constraint priority")?;
+    Ok((entity_a, entity_b))
+}
+
+fn parse_ragdoll_constraint(reader: &mut Reader<'_>) -> Result<ConstraintData, Fo3Error> {
+    let twist_a = read_vec4(reader, "ragdoll twist A")?;
+    let plane_a = read_vec4(reader, "ragdoll plane A")?;
+    read_vec4(reader, "ragdoll motor A")?;
+    let pivot_a = read_vec4(reader, "ragdoll pivot A")?;
+    let twist_b = read_vec4(reader, "ragdoll twist B")?;
+    let plane_b = read_vec4(reader, "ragdoll plane B")?;
+    read_vec4(reader, "ragdoll motor B")?;
+    let pivot_b = read_vec4(reader, "ragdoll pivot B")?;
+    let data = RagdollConstraint {
+        twist_a,
+        plane_a,
+        pivot_a,
+        twist_b,
+        plane_b,
+        pivot_b,
+        cone_max_angle: reader.read_f32("ragdoll cone maximum")?,
+        plane_min_angle: reader.read_f32("ragdoll plane minimum")?,
+        plane_max_angle: reader.read_f32("ragdoll plane maximum")?,
+        twist_min_angle: reader.read_f32("ragdoll twist minimum")?,
+        twist_max_angle: reader.read_f32("ragdoll twist maximum")?,
+    };
+    reader.read_f32("ragdoll maximum friction")?;
+    skip_constraint_motor(reader)?;
+    Ok(ConstraintData::Ragdoll(data))
+}
+
+fn parse_limited_hinge_constraint(reader: &mut Reader<'_>) -> Result<ConstraintData, Fo3Error> {
+    let axis_a = read_vec4(reader, "limited hinge axis A")?;
+    let perpendicular_a = read_vec4(reader, "limited hinge perpendicular A1")?;
+    read_vec4(reader, "limited hinge perpendicular A2")?;
+    let pivot_a = read_vec4(reader, "limited hinge pivot A")?;
+    let axis_b = read_vec4(reader, "limited hinge axis B")?;
+    let perpendicular_b = read_vec4(reader, "limited hinge perpendicular B1")?;
+    read_vec4(reader, "limited hinge perpendicular B2")?;
+    let pivot_b = read_vec4(reader, "limited hinge pivot B")?;
+    let data = LimitedHingeConstraint {
+        axis_a,
+        perpendicular_a,
+        pivot_a,
+        axis_b,
+        perpendicular_b,
+        pivot_b,
+        min_angle: reader.read_f32("limited hinge minimum")?,
+        max_angle: reader.read_f32("limited hinge maximum")?,
+    };
+    reader.read_f32("limited hinge maximum friction")?;
+    skip_constraint_motor(reader)?;
+    Ok(ConstraintData::LimitedHinge(data))
+}
+
+fn parse_hinge_constraint(reader: &mut Reader<'_>) -> Result<ConstraintData, Fo3Error> {
+    let axis_a = read_vec4(reader, "hinge axis A")?;
+    let perpendicular_a = read_vec4(reader, "hinge perpendicular A1")?;
+    read_vec4(reader, "hinge perpendicular A2")?;
+    let pivot_a = read_vec4(reader, "hinge pivot A")?;
+    let axis_b = read_vec4(reader, "hinge axis B")?;
+    let perpendicular_b = read_vec4(reader, "hinge perpendicular B1")?;
+    read_vec4(reader, "hinge perpendicular B2")?;
+    let pivot_b = read_vec4(reader, "hinge pivot B")?;
+    Ok(ConstraintData::Hinge(HingeConstraint {
+        axis_a,
+        perpendicular_a,
+        pivot_a,
+        axis_b,
+        perpendicular_b,
+        pivot_b,
+    }))
+}
+
+fn parse_ball_and_socket_constraint(reader: &mut Reader<'_>) -> Result<ConstraintData, Fo3Error> {
+    Ok(ConstraintData::BallAndSocket(BallAndSocketConstraint {
+        pivot_a: read_vec4(reader, "ball and socket pivot A")?,
+        pivot_b: read_vec4(reader, "ball and socket pivot B")?,
+    }))
+}
+
+fn parse_prismatic_constraint(reader: &mut Reader<'_>) -> Result<ConstraintData, Fo3Error> {
+    let sliding_a = read_vec4(reader, "prismatic sliding A")?;
+    let rotation_a = read_vec4(reader, "prismatic rotation A")?;
+    read_vec4(reader, "prismatic plane A")?;
+    let pivot_a = read_vec4(reader, "prismatic pivot A")?;
+    let sliding_b = read_vec4(reader, "prismatic sliding B")?;
+    let rotation_b = read_vec4(reader, "prismatic rotation B")?;
+    read_vec4(reader, "prismatic plane B")?;
+    let pivot_b = read_vec4(reader, "prismatic pivot B")?;
+    let data = PrismaticConstraint {
+        sliding_a,
+        rotation_a,
+        pivot_a,
+        sliding_b,
+        rotation_b,
+        pivot_b,
+        min_distance: reader.read_f32("prismatic minimum distance")?,
+        max_distance: reader.read_f32("prismatic maximum distance")?,
+    };
+    reader.read_f32("prismatic friction")?;
+    skip_constraint_motor(reader)?;
+    Ok(ConstraintData::Prismatic(data))
+}
+
+fn skip_constraint_motor(reader: &mut Reader<'_>) -> Result<(), Fo3Error> {
+    let payload_size = match reader.read_u8("constraint motor type")? {
+        0 => 0,
+        1 => 25,
+        2 => 18,
+        3 => 17,
+        value => {
+            return Err(Fo3Error::InvalidEnum {
+                field: "constraint motor type",
+                value: u32::from(value),
+            });
+        }
+    };
+    reader.take(payload_size, "constraint motor")?;
+    Ok(())
 }
 
 fn parse_simple_shape_phantom(
@@ -1212,5 +1638,148 @@ pub fn quality_type_name(value: u8) -> &'static str {
         8 => "MO_QUAL_CHARACTER",
         9 => "MO_QUAL_KEYFRAMED_REPORT",
         _ => "MO_QUAL_INVALID",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_i32(bytes: &mut Vec<u8>, value: i32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_f32(bytes: &mut Vec<u8>, value: f32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_vec4(bytes: &mut Vec<u8>, value: [f32; 4]) {
+        for component in value {
+            push_f32(bytes, component);
+        }
+    }
+
+    fn push_constraint_info(bytes: &mut Vec<u8>, body_a: i32, body_b: i32) {
+        push_u32(bytes, 2);
+        push_i32(bytes, body_a);
+        push_i32(bytes, body_b);
+        push_u32(bytes, 1);
+    }
+
+    fn block(type_name: &str, bytes: Vec<u8>) -> RawBlock {
+        RawBlock {
+            index: 7,
+            type_name: type_name.into(),
+            bytes,
+        }
+    }
+
+    fn ragdoll_payload(bytes: &mut Vec<u8>) {
+        for value in [
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 2.0, 3.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [4.0, 5.0, 6.0, 0.0],
+        ] {
+            push_vec4(bytes, value);
+        }
+        for value in [1.2, -0.4, 0.5, -0.7, 0.8, 100.0] {
+            push_f32(bytes, value);
+        }
+        bytes.push(0); // MOTOR_NONE
+    }
+
+    fn limited_hinge_payload(bytes: &mut Vec<u8>) {
+        for value in [
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 2.0, 3.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [4.0, 5.0, 6.0, 0.0],
+        ] {
+            push_vec4(bytes, value);
+        }
+        for value in [-0.2, 1.4, 100.0] {
+            push_f32(bytes, value);
+        }
+        bytes.push(0); // MOTOR_NONE
+    }
+
+    #[test]
+    fn direct_ragdoll_constraint_decodes_fo3_field_order() {
+        let mut bytes = Vec::new();
+        push_constraint_info(&mut bytes, 12, 34);
+        ragdoll_payload(&mut bytes);
+        let block = block("bhkRagdollConstraint", bytes);
+        let mut reader = Reader::new(&block.bytes);
+
+        let constraint = parse_constraint_block(&block, &mut reader).unwrap();
+
+        assert_eq!((constraint.entity_a, constraint.entity_b), (12, 34));
+        let ConstraintData::Ragdoll(data) = constraint.data else {
+            panic!("expected ragdoll constraint");
+        };
+        assert_eq!(data.pivot_a, [1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(data.pivot_b, [4.0, 5.0, 6.0, 0.0]);
+        assert_eq!(data.cone_max_angle, 1.2);
+        assert_eq!(data.twist_max_angle, 0.8);
+        assert_eq!(constraint.malleable_strength, None);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn malleable_limited_hinge_decodes_nested_info_and_strength() {
+        let mut bytes = Vec::new();
+        push_constraint_info(&mut bytes, 12, 34);
+        push_u32(&mut bytes, 2); // LIMITED_HINGE
+        push_constraint_info(&mut bytes, 12, 34);
+        limited_hinge_payload(&mut bytes);
+        push_f32(&mut bytes, 0.9);
+        let block = block("bhkMalleableConstraint", bytes);
+        let mut reader = Reader::new(&block.bytes);
+
+        let constraint = parse_constraint_block(&block, &mut reader).unwrap();
+
+        let ConstraintData::LimitedHinge(data) = constraint.data else {
+            panic!("expected limited hinge constraint");
+        };
+        assert_eq!(data.axis_a, [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(data.pivot_b, [4.0, 5.0, 6.0, 0.0]);
+        assert_eq!((data.min_angle, data.max_angle), (-0.2, 1.4));
+        assert_eq!(constraint.malleable_strength, Some(0.9));
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn joint_frame_places_authored_axis_on_local_z() {
+        let frame = joint_frame_quaternion(Vec3::Z, Vec3::X).unwrap();
+        let rotation = Quat::from_array(frame);
+        assert!((rotation * Vec3::Z - Vec3::Z).length() < 1.0e-6);
+        assert!((rotation * Vec3::X - Vec3::X).length() < 1.0e-6);
+        assert!(frame[3] >= 0.0);
+    }
+
+    #[test]
+    fn rigid_body_center_of_mass_is_flattened_with_its_body_frame() {
+        let frame = Mat4::from_rotation_translation(
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            Vec3::new(1.0, 2.0, 3.0),
+        );
+
+        let center = rigid_body_point([10.0, 0.0, 0.0, 0.0], frame);
+
+        let expected = Vec3::new(1.0, 3.0, -(2.0 + 10.0 * HAVOK_TO_METRES));
+        assert!((Vec3::from_array(center) - expected).length() < 1.0e-6);
     }
 }

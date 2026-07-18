@@ -1165,7 +1165,10 @@ mod tests {
         let values = rotations.into_f32().collect::<Vec<_>>();
         assert_eq!(values.len(), 1);
         for (actual, expected) in values[0].into_iter().zip(expected) {
-            assert!((actual - expected).abs() <= 1.0e-6, "{actual} != {expected}");
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "{actual} != {expected}"
+            );
         }
     }
 

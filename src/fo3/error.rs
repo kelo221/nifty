@@ -61,4 +61,6 @@ pub enum Fo3Error {
     },
     #[error("integer overflow while calculating {0}")]
     Overflow(&'static str),
+    #[error("unsupported {field} value {value}")]
+    InvalidEnum { field: &'static str, value: u32 },
 }

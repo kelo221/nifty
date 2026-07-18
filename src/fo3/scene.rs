@@ -438,10 +438,12 @@ fn extract_animation_sound_cues(
 ) -> Result<Vec<SceneAnimationSoundCue>, SceneError> {
     let mut cues = Vec::new();
     for index in 0..document.blocks.len() {
-        let sequence = match document.decode_block(index).map_err(|error| SceneError::Decode {
-            block: index,
-            message: error.to_string(),
-        })? {
+        let sequence = match document
+            .decode_block(index)
+            .map_err(|error| SceneError::Decode {
+                block: index,
+                message: error.to_string(),
+            })? {
             TypedBlock::ControllerSequence(sequence) => sequence,
             _ => continue,
         };
@@ -449,12 +451,13 @@ fn extract_animation_sound_cues(
             continue;
         }
         let text_key_index = sequence.text_keys as usize;
-        let text_keys = document
-            .decode_block(text_key_index)
-            .map_err(|error| SceneError::Decode {
-                block: text_key_index,
-                message: error.to_string(),
-            })?;
+        let text_keys =
+            document
+                .decode_block(text_key_index)
+                .map_err(|error| SceneError::Decode {
+                    block: text_key_index,
+                    message: error.to_string(),
+                })?;
         let TypedBlock::TextKeyExtraData(TextKeyExtraData { keys }) = text_keys else {
             return Err(SceneError::InvalidBlockReference {
                 source_block: index,
@@ -698,9 +701,7 @@ fn merge_animation_channel(
 ///
 /// XYZ Euler tracks are constructed with `glam::Quat` and already use XYZW,
 /// so they must bypass this source-format conversion.
-fn nif_wxyz_rotation_key_to_gltf_xyzw(
-    key: AnimationKey<[f32; 4]>,
-) -> AnimationKey<[f32; 4]> {
+fn nif_wxyz_rotation_key_to_gltf_xyzw(key: AnimationKey<[f32; 4]>) -> AnimationKey<[f32; 4]> {
     let [w, x, y, z] = key.value;
     AnimationKey {
         time: key.time,
@@ -1406,7 +1407,10 @@ mod tests {
 
     fn assert_quaternion_close(actual: [f32; 4], expected: [f32; 4]) {
         for (actual, expected) in actual.into_iter().zip(expected) {
-            assert!((actual - expected).abs() <= 1.0e-6, "{actual} != {expected}");
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "{actual} != {expected}"
+            );
         }
     }
 

@@ -1,6 +1,6 @@
 use super::{
-    decode_physics_block, CollisionObject, Document, Fo3Error, PackedTriStripsData, PhysicsShape,
-    RawBlock, Reader, RigidBody, SimpleShapePhantom,
+    decode_physics_block, CollisionObject, Constraint, Document, Fo3Error, PackedTriStripsData,
+    PhysicsShape, RawBlock, Reader, RigidBody, SimpleShapePhantom,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +274,7 @@ pub enum TypedBlock {
     SkinPartitionData(SkinPartitionData),
     CollisionObject(CollisionObject),
     RigidBody(RigidBody),
+    Constraint(Constraint),
     SimpleShapePhantom(SimpleShapePhantom),
     PhysicsShape(PhysicsShape),
     PackedTriStripsData(PackedTriStripsData),
@@ -330,9 +331,11 @@ impl Document {
                 "NiControllerSequence" => TypedBlock::ControllerSequence(
                     parse_controller_sequence(self, block, &mut reader)?,
                 ),
-                "NiTextKeyExtraData" => TypedBlock::TextKeyExtraData(
-                    parse_text_key_extra_data(self, block, &mut reader)?,
-                ),
+                "NiTextKeyExtraData" => TypedBlock::TextKeyExtraData(parse_text_key_extra_data(
+                    self,
+                    block,
+                    &mut reader,
+                )?),
                 "NiMaterialProperty" => {
                     TypedBlock::MaterialProperty(parse_material_property(self, block, &mut reader)?)
                 }
@@ -1196,7 +1199,11 @@ fn parse_text_key_extra_data(
     block: &RawBlock,
     reader: &mut Reader<'_>,
 ) -> Result<TextKeyExtraData, Fo3Error> {
-    let _name = resolve_string(document, block, reader.read_i32("text key extra data name")?)?;
+    let _name = resolve_string(
+        document,
+        block,
+        reader.read_i32("text key extra data name")?,
+    )?;
     let count = reader.read_u32("text key count")? as usize;
     let count = checked_count(block, reader, count, 8, "text key")?;
     let mut keys = Vec::with_capacity(count);
