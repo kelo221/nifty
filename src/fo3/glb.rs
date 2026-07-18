@@ -120,6 +120,18 @@ pub fn encode_glb(
         .iter()
         .map(|&index| Index::new(index as u32))
         .collect::<Vec<_>>();
+    let animation_sound_cues = scene
+        .animation_sound_cues
+        .iter()
+        .map(|cue| {
+            serde_json::json!({
+                "sequence": cue.sequence,
+                "time": cue.time,
+                "editor_id": cue.editor_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let animation_sound_cues = serde_json::to_string(&animation_sound_cues)?;
     let coordinate_root = writer.root.nodes.len();
     writer.root.nodes.push(json::Node {
         camera: None,
@@ -134,6 +146,7 @@ pub fn encode_glb(
             "bevyout_source_render_triangles": scene.statistics.source_triangles,
             "bevyout_root_transform_policy": "preserve",
             "bevyout_native_nif_converter": true,
+            "bevyout_animation_sound_cues": animation_sound_cues,
         }))?,
         matrix: None,
         mesh: None,
@@ -985,6 +998,7 @@ mod tests {
             issues: Vec::new(),
             statistics: super::super::SceneStatistics::default(),
             animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
         };
         let mut textures = BTreeMap::new();
         textures.insert(
@@ -1072,6 +1086,7 @@ mod tests {
                 source_triangles: 1,
             },
             animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
         };
         let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
             .expect("encode skinned GLB");
@@ -1127,6 +1142,7 @@ mod tests {
                     scales: Vec::new(),
                 }],
             }],
+            animation_sound_cues: Vec::new(),
         };
         let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
             .expect("encode animated GLB");

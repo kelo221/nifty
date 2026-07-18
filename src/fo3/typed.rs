@@ -68,7 +68,13 @@ pub struct ControllerSequence {
     pub name: String,
     pub start_time: f32,
     pub stop_time: f32,
+    pub text_keys: i32,
     pub controlled_blocks: Vec<ControlledBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextKeyExtraData {
+    pub keys: Vec<AnimationKey<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -276,6 +282,7 @@ pub enum TypedBlock {
     TransformData(TransformData),
     ControllerManager(ControllerManager),
     ControllerSequence(ControllerSequence),
+    TextKeyExtraData(TextKeyExtraData),
     Unsupported,
 }
 
@@ -322,6 +329,9 @@ impl Document {
                 }
                 "NiControllerSequence" => TypedBlock::ControllerSequence(
                     parse_controller_sequence(self, block, &mut reader)?,
+                ),
+                "NiTextKeyExtraData" => TypedBlock::TextKeyExtraData(
+                    parse_text_key_extra_data(self, block, &mut reader)?,
                 ),
                 "NiMaterialProperty" => {
                     TypedBlock::MaterialProperty(parse_material_property(self, block, &mut reader)?)
@@ -1154,7 +1164,7 @@ fn parse_controller_sequence(
         });
     }
     let _weight = reader.read_f32("sequence weight")?;
-    let _text_keys = reader.read_i32("sequence text keys")?;
+    let text_keys = reader.read_i32("sequence text keys")?;
     let _cycle_type = reader.read_u32("sequence cycle type")?;
     let _frequency = reader.read_f32("sequence frequency")?;
     let start_time = reader.read_f32("sequence start time")?;
@@ -1176,8 +1186,27 @@ fn parse_controller_sequence(
         name,
         start_time,
         stop_time,
+        text_keys,
         controlled_blocks,
     })
+}
+
+fn parse_text_key_extra_data(
+    document: &Document,
+    block: &RawBlock,
+    reader: &mut Reader<'_>,
+) -> Result<TextKeyExtraData, Fo3Error> {
+    let _name = resolve_string(document, block, reader.read_i32("text key extra data name")?)?;
+    let count = reader.read_u32("text key count")? as usize;
+    let count = checked_count(block, reader, count, 8, "text key")?;
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        let time = reader.read_f32("text key time")?;
+        let value = resolve_string(document, block, reader.read_i32("text key value")?)?
+            .unwrap_or_default();
+        keys.push(AnimationKey { time, value });
+    }
+    Ok(TextKeyExtraData { keys })
 }
 
 fn parse_scalar_group(

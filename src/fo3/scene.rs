@@ -6,8 +6,8 @@ use thiserror::Error;
 use super::{
     AlphaProperty, AnimationKey, AnimationKeyGroup, AvObject, Document, Geometry, GeometryData,
     MaterialProperty, NoLightingProperty, Node, PpLightingProperty, ShaderTextureSet, SkinData,
-    SkinInstance, SkinPartitionData, Transform, TransformData, TransformInterpolator,
-    TriStripsData, TypedBlock,
+    SkinInstance, SkinPartitionData, TextKeyExtraData, Transform, TransformData,
+    TransformInterpolator, TriStripsData, TypedBlock,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,13 @@ pub struct SceneAnimationChannel {
     pub scales: Vec<AnimationKey<f32>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneAnimationSoundCue {
+    pub sequence: String,
+    pub time: f32,
+    pub editor_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneIssue {
     pub source_block: usize,
@@ -107,6 +114,7 @@ pub struct Scene {
     pub issues: Vec<SceneIssue>,
     pub statistics: SceneStatistics,
     pub animations: Vec<SceneAnimation>,
+    pub animation_sound_cues: Vec<SceneAnimationSoundCue>,
 }
 
 impl Scene {
@@ -401,6 +409,7 @@ pub fn extract_scene(document: &Document) -> Result<Scene, SceneError> {
             issues: Vec::new(),
             statistics: SceneStatistics::default(),
             animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
         },
         node_by_block: HashMap::new(),
         visiting: HashSet::new(),
@@ -420,7 +429,80 @@ pub fn extract_scene(document: &Document) -> Result<Scene, SceneError> {
         return Err(SceneError::NoRoots);
     }
     builder.scene.animations = extract_animations(document, &builder.scene.nodes)?;
+    builder.scene.animation_sound_cues = extract_animation_sound_cues(document)?;
     Ok(builder.scene)
+}
+
+fn extract_animation_sound_cues(
+    document: &Document,
+) -> Result<Vec<SceneAnimationSoundCue>, SceneError> {
+    let mut cues = Vec::new();
+    for index in 0..document.blocks.len() {
+        let sequence = match document.decode_block(index).map_err(|error| SceneError::Decode {
+            block: index,
+            message: error.to_string(),
+        })? {
+            TypedBlock::ControllerSequence(sequence) => sequence,
+            _ => continue,
+        };
+        if sequence.text_keys < 0 {
+            continue;
+        }
+        let text_key_index = sequence.text_keys as usize;
+        let text_keys = document
+            .decode_block(text_key_index)
+            .map_err(|error| SceneError::Decode {
+                block: text_key_index,
+                message: error.to_string(),
+            })?;
+        let TypedBlock::TextKeyExtraData(TextKeyExtraData { keys }) = text_keys else {
+            return Err(SceneError::InvalidBlockReference {
+                source_block: index,
+                field: "sequence text keys",
+                reference: sequence.text_keys,
+                block_count: document.blocks.len(),
+            });
+        };
+        for key in keys {
+            append_animation_sound_cues(&mut cues, &sequence.name, key.time, &key.value);
+        }
+    }
+    cues.sort_by(|left, right| {
+        left.sequence
+            .to_ascii_lowercase()
+            .cmp(&right.sequence.to_ascii_lowercase())
+            .then_with(|| left.time.total_cmp(&right.time))
+            .then_with(|| {
+                left.editor_id
+                    .to_ascii_lowercase()
+                    .cmp(&right.editor_id.to_ascii_lowercase())
+            })
+            .then_with(|| left.editor_id.cmp(&right.editor_id))
+    });
+    Ok(cues)
+}
+
+fn append_animation_sound_cues(
+    cues: &mut Vec<SceneAnimationSoundCue>,
+    sequence: &str,
+    time: f32,
+    text: &str,
+) {
+    for line in text.replace('\r', "\n").split('\n') {
+        let Some((prefix, value)) = line.split_once(':') else {
+            continue;
+        };
+        if prefix.trim().eq_ignore_ascii_case("sound") {
+            let editor_id = value.trim();
+            if !editor_id.is_empty() {
+                cues.push(SceneAnimationSoundCue {
+                    sequence: sequence.to_owned(),
+                    time,
+                    editor_id: editor_id.to_owned(),
+                });
+            }
+        }
+    }
 }
 
 fn extract_animations(
@@ -1271,6 +1353,32 @@ pub fn normalize_texture_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_cues_are_case_insensitive_and_normalize_carriage_returns() {
+        let mut cues = Vec::new();
+        append_animation_sound_cues(
+            &mut cues,
+            "Open",
+            0.25,
+            "start\rSound: DRSAmmoBoxOpen\r\nsound: DRSRefrigeratorOpen\r",
+        );
+        assert_eq!(
+            cues,
+            vec![
+                SceneAnimationSoundCue {
+                    sequence: "Open".into(),
+                    time: 0.25,
+                    editor_id: "DRSAmmoBoxOpen".into(),
+                },
+                SceneAnimationSoundCue {
+                    sequence: "Open".into(),
+                    time: 0.25,
+                    editor_id: "DRSRefrigeratorOpen".into(),
+                },
+            ]
+        );
+    }
 
     fn scalar_keys(values: &[(f32, f32)]) -> AnimationKeyGroup<f32> {
         AnimationKeyGroup {
