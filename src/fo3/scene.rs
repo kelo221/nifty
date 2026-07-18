@@ -1,0 +1,849 @@
+use std::collections::{HashMap, HashSet};
+
+use glam::{EulerRot, Quat};
+use thiserror::Error;
+
+use super::{
+    AlphaProperty, AnimationKey, AnimationKeyGroup, AvObject, Document, Geometry, GeometryData,
+    MaterialProperty, NoLightingProperty, Node, PpLightingProperty, ShaderTextureSet, Transform,
+    TransformData, TransformInterpolator, TriStripsData, TypedBlock,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneAlphaMode {
+    Opaque,
+    Mask,
+    Blend,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneMaterial {
+    pub name: String,
+    pub base_color: [f32; 4],
+    pub emissive: [f32; 3],
+    pub emissive_multiplier: f32,
+    pub roughness: f32,
+    pub alpha_mode: SceneAlphaMode,
+    pub alpha_cutoff: Option<f32>,
+    pub double_sided: bool,
+    pub unlit: bool,
+    pub diffuse_texture: Option<String>,
+    pub normal_texture: Option<String>,
+    pub glow_texture: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneMesh {
+    pub name: String,
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub tangents: Vec<[f32; 4]>,
+    pub colors: Vec<[f32; 4]>,
+    pub tex_coords: Vec<[f32; 2]>,
+    pub indices: Vec<u16>,
+    pub material: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneNode {
+    pub source_block: usize,
+    pub name: String,
+    pub transform: Transform,
+    pub children: Vec<usize>,
+    pub mesh: Option<SceneMesh>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneAnimation {
+    pub name: String,
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub channels: Vec<SceneAnimationChannel>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneAnimationChannel {
+    pub node: usize,
+    pub translations: Vec<AnimationKey<[f32; 3]>>,
+    pub rotations: Vec<AnimationKey<[f32; 4]>>,
+    pub scales: Vec<AnimationKey<f32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneIssue {
+    pub source_block: usize,
+    pub type_name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SceneStatistics {
+    pub source_meshes: usize,
+    pub source_vertices: usize,
+    pub source_triangles: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scene {
+    pub nodes: Vec<SceneNode>,
+    pub roots: Vec<usize>,
+    pub materials: Vec<SceneMaterial>,
+    pub issues: Vec<SceneIssue>,
+    pub statistics: SceneStatistics,
+    pub animations: Vec<SceneAnimation>,
+}
+
+impl Scene {
+    pub fn is_lossless(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SceneError {
+    #[error("NIF has no usable scene roots")]
+    NoRoots,
+    #[error(
+        "block {source_block} field {field} references invalid block {reference} (block count {block_count})"
+    )]
+    InvalidBlockReference {
+        source_block: usize,
+        field: &'static str,
+        reference: i32,
+        block_count: usize,
+    },
+    #[error("cycle detected while traversing scene block {block}")]
+    SceneCycle { block: usize },
+    #[error("could not decode block {block}: {message}")]
+    Decode { block: usize, message: String },
+}
+
+pub fn extract_scene(document: &Document) -> Result<Scene, SceneError> {
+    let mut builder = SceneBuilder {
+        document,
+        scene: Scene {
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            materials: Vec::new(),
+            issues: Vec::new(),
+            statistics: SceneStatistics::default(),
+            animations: Vec::new(),
+        },
+        node_by_block: HashMap::new(),
+        visiting: HashSet::new(),
+    };
+
+    for &root in &document.roots {
+        if root < 0 {
+            continue;
+        }
+        if let Some(node) = builder.visit(root as usize)? {
+            builder.scene.roots.push(node);
+        }
+    }
+    builder.scene.roots.sort_unstable();
+    builder.scene.roots.dedup();
+    if builder.scene.roots.is_empty() {
+        return Err(SceneError::NoRoots);
+    }
+    builder.scene.animations = extract_animations(document, &builder.scene.nodes)?;
+    Ok(builder.scene)
+}
+
+fn extract_animations(
+    document: &Document,
+    nodes: &[SceneNode],
+) -> Result<Vec<SceneAnimation>, SceneError> {
+    let mut by_source = HashMap::new();
+    let mut by_name = HashMap::<String, usize>::new();
+    for (index, node) in nodes.iter().enumerate() {
+        by_source.insert(node.source_block, index);
+        by_name.entry(node.name.clone()).or_insert(index);
+        if let Some((base, _)) = node_base(document, node.source_block)? {
+            if let Some(name) = &base.object.name {
+                by_name.entry(name.clone()).or_insert(index);
+            }
+        }
+    }
+
+    let mut animations = Vec::new();
+    let mut sequence_nodes = HashSet::new();
+    for index in 0..document.blocks.len() {
+        let sequence = match document
+            .decode_block(index)
+            .map_err(|error| SceneError::Decode {
+                block: index,
+                message: error.to_string(),
+            })? {
+            TypedBlock::ControllerSequence(sequence) => sequence,
+            _ => continue,
+        };
+        let mut channels = Vec::new();
+        for controlled in sequence.controlled_blocks {
+            let node = by_name.get(&controlled.node_name).copied().or_else(|| {
+                controlled
+                    .node_name
+                    .split_once(':')
+                    .and_then(|(name, _)| by_name.get(name).copied())
+            });
+            let Some(node) = node else { continue };
+            let Some(data) = transform_data(document, controlled.interpolator)? else {
+                continue;
+            };
+            sequence_nodes.insert(node);
+            merge_animation_channel(&mut channels, node, data);
+        }
+        if !channels.is_empty() {
+            let stop_time = if sequence.stop_time > sequence.start_time {
+                sequence.stop_time
+            } else {
+                channels
+                    .iter()
+                    .flat_map(|channel| {
+                        channel
+                            .translations
+                            .iter()
+                            .map(|key| key.time)
+                            .chain(channel.rotations.iter().map(|key| key.time))
+                            .chain(channel.scales.iter().map(|key| key.time))
+                    })
+                    .fold(sequence.start_time, f32::max)
+            };
+            animations.push(SceneAnimation {
+                name: sequence.name,
+                start_time: sequence.start_time,
+                stop_time,
+                channels,
+            });
+        }
+    }
+
+    // Some props carry a controller directly on the node and no controller sequence. Preserve
+    // those single-track animations under a stable synthetic name.
+    for (node_index, node) in nodes.iter().enumerate() {
+        if sequence_nodes.contains(&node_index) {
+            continue;
+        }
+        let Some((base, _)) = node_base(document, node.source_block)? else {
+            continue;
+        };
+        let controller = base.object.controller;
+        if controller < 0 {
+            continue;
+        }
+        let controller = match document
+            .decode_block(controller as usize)
+            .map_err(|error| SceneError::Decode {
+                block: controller as usize,
+                message: error.to_string(),
+            })? {
+            TypedBlock::TransformController(controller) => controller,
+            _ => continue,
+        };
+        let Some(data) = transform_data(document, controller.interpolator)? else {
+            continue;
+        };
+        let mut channels = Vec::new();
+        merge_animation_channel(&mut channels, node_index, data);
+        let stop_time = controller.stop_time.max(controller.start_time);
+        animations.push(SceneAnimation {
+            name: format!("{}:direct", node.name),
+            start_time: controller.start_time,
+            stop_time,
+            channels,
+        });
+    }
+    Ok(animations)
+}
+
+fn node_base(
+    document: &Document,
+    source_block: usize,
+) -> Result<Option<(AvObject, bool)>, SceneError> {
+    let block = document
+        .decode_block(source_block)
+        .map_err(|error| SceneError::Decode {
+            block: source_block,
+            message: error.to_string(),
+        })?;
+    Ok(match block {
+        TypedBlock::Node(node) => Some((node.base, true)),
+        TypedBlock::Geometry(geometry) => Some((geometry.base, false)),
+        _ => None,
+    })
+}
+
+fn transform_data(
+    document: &Document,
+    interpolator_reference: i32,
+) -> Result<Option<TransformData>, SceneError> {
+    if interpolator_reference < 0 {
+        return Ok(None);
+    }
+    let interpolator = document
+        .decode_block(interpolator_reference as usize)
+        .map_err(|error| SceneError::Decode {
+            block: interpolator_reference as usize,
+            message: error.to_string(),
+        })?;
+    let TypedBlock::TransformInterpolator(TransformInterpolator { data, .. }) = interpolator else {
+        return Ok(None);
+    };
+    if data < 0 {
+        return Ok(None);
+    }
+    let data = document
+        .decode_block(data as usize)
+        .map_err(|error| SceneError::Decode {
+            block: data as usize,
+            message: error.to_string(),
+        })?;
+    Ok(match data {
+        TypedBlock::TransformData(data) => Some(data),
+        _ => None,
+    })
+}
+
+fn merge_animation_channel(
+    channels: &mut Vec<SceneAnimationChannel>,
+    node: usize,
+    data: TransformData,
+) {
+    let TransformData {
+        mut rotations,
+        xyz_rotations,
+        translations,
+        scales,
+    } = data;
+    if let Some(xyz_rotations) = xyz_rotations {
+        rotations.extend(xyz_rotation_keys(&xyz_rotations));
+    }
+    if translations.keys.is_empty() && rotations.is_empty() && scales.keys.is_empty() {
+        return;
+    }
+    let Some(channel) = channels.iter_mut().find(|channel| channel.node == node) else {
+        channels.push(SceneAnimationChannel {
+            node,
+            translations: translations.keys,
+            rotations: rotations
+                .into_iter()
+                .map(|key| AnimationKey {
+                    time: key.time,
+                    value: [key.value[1], key.value[2], key.value[3], key.value[0]],
+                })
+                .collect(),
+            scales: scales.keys,
+        });
+        return;
+    };
+    channel.translations.extend(translations.keys);
+    channel
+        .rotations
+        .extend(rotations.into_iter().map(|key| AnimationKey {
+            time: key.time,
+            value: [key.value[1], key.value[2], key.value[3], key.value[0]],
+        }));
+    channel.scales.extend(scales.keys);
+}
+
+fn xyz_rotation_keys(groups: &[AnimationKeyGroup<f32>; 3]) -> Vec<AnimationKey<[f32; 4]>> {
+    let mut times = groups
+        .iter()
+        .flat_map(|group| group.keys.iter().map(|key| key.time))
+        .collect::<Vec<_>>();
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-6);
+    times
+        .into_iter()
+        .map(|time| {
+            let angles = groups
+                .iter()
+                .map(|group| sample_scalar_group(group, time))
+                .collect::<Vec<_>>();
+            AnimationKey {
+                time,
+                value: Quat::from_euler(EulerRot::XYZ, angles[0], angles[1], angles[2]).to_array(),
+            }
+        })
+        .collect()
+}
+
+fn sample_scalar_group(group: &AnimationKeyGroup<f32>, time: f32) -> f32 {
+    let Some(first) = group.keys.first() else {
+        return 0.0;
+    };
+    if time <= first.time {
+        return first.value;
+    }
+    let Some(last) = group.keys.last() else {
+        return first.value;
+    };
+    if time >= last.time {
+        return last.value;
+    }
+    for pair in group.keys.windows(2) {
+        let [left, right] = pair else { continue };
+        if time <= right.time {
+            let span = right.time - left.time;
+            let weight = if span.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                (time - left.time) / span
+            };
+            return left.value + (right.value - left.value) * weight;
+        }
+    }
+    last.value
+}
+
+struct SceneBuilder<'a> {
+    document: &'a Document,
+    scene: Scene,
+    node_by_block: HashMap<usize, usize>,
+    visiting: HashSet<usize>,
+}
+
+impl SceneBuilder<'_> {
+    fn visit(&mut self, block_index: usize) -> Result<Option<usize>, SceneError> {
+        if let Some(&node) = self.node_by_block.get(&block_index) {
+            return Ok(Some(node));
+        }
+        if !self.visiting.insert(block_index) {
+            return Err(SceneError::SceneCycle { block: block_index });
+        }
+        let block = self.block(block_index, block_index, "scene child")?;
+        let result = match self.decode(block_index)? {
+            TypedBlock::Node(node) => self.visit_node(block_index, node),
+            TypedBlock::Geometry(geometry) => self.visit_geometry(block_index, geometry),
+            TypedBlock::Unsupported => {
+                self.issue(
+                    block_index,
+                    format!(
+                        "reachable {} is not supported by the props converter",
+                        block.type_name
+                    ),
+                );
+                Ok(None)
+            }
+            _ => {
+                self.issue(
+                    block_index,
+                    format!(
+                        "reachable {} is data rather than a scene object",
+                        block.type_name
+                    ),
+                );
+                Ok(None)
+            }
+        };
+        self.visiting.remove(&block_index);
+        result
+    }
+
+    fn visit_node(&mut self, block_index: usize, node: Node) -> Result<Option<usize>, SceneError> {
+        let scene_index = self.push_node(block_index, &node.base, None);
+        let children = if node.lod_data.is_some() {
+            node.children
+                .first()
+                .copied()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else if let Some((_, active)) = node.switch {
+            usize::try_from(active)
+                .ok()
+                .and_then(|index| node.children.get(index).copied())
+                .into_iter()
+                .collect()
+        } else {
+            node.children
+        };
+        let mut scene_children = Vec::new();
+        for child in children {
+            if child < 0 {
+                continue;
+            }
+            self.block(block_index, child as usize, "child")?;
+            if let Some(child) = self.visit(child as usize)? {
+                scene_children.push(child);
+            }
+        }
+        self.scene.nodes[scene_index].children = scene_children;
+        Ok(Some(scene_index))
+    }
+
+    fn visit_geometry(
+        &mut self,
+        block_index: usize,
+        geometry: Geometry,
+    ) -> Result<Option<usize>, SceneError> {
+        if geometry.skin_instance >= 0 {
+            self.issue(
+                block_index,
+                "skinned geometry is deferred until the actor milestone".into(),
+            );
+            return Ok(None);
+        }
+        let data_index = self.reference(block_index, geometry.data, "geometry data")?;
+        let data_type = self.document.blocks[data_index].type_name.clone();
+        let (data, triangles) = match self.decode(data_index)? {
+            TypedBlock::TriShapeData(data) => {
+                let triangles = data.triangles.clone();
+                (data.geometry, triangles)
+            }
+            TypedBlock::TriStripsData(data) => {
+                let triangles = triangulate_strips(&data);
+                (data.geometry, triangles)
+            }
+            _ => {
+                self.issue(
+                    data_index,
+                    format!("geometry data type {data_type} is not supported"),
+                );
+                return Ok(None);
+            }
+        };
+        if data.vertices.is_empty() || triangles.is_empty() {
+            self.issue(data_index, "geometry has no renderable triangles".into());
+            return Ok(None);
+        }
+        let indices = triangles.into_iter().flatten().collect::<Vec<_>>();
+        let vertex_count = data.vertices.len();
+        if indices.iter().any(|&index| index as usize >= vertex_count) {
+            self.issue(
+                data_index,
+                "geometry contains an out-of-range vertex index".into(),
+            );
+            return Ok(None);
+        }
+
+        let material = self.extract_material(block_index, &geometry)?;
+        let tangents = tangents(&data);
+        let mesh = SceneMesh {
+            name: geometry.base.object.name.clone().unwrap_or_else(|| {
+                format!(
+                    "{}#{block_index}",
+                    self.document.blocks[block_index].type_name
+                )
+            }),
+            positions: data.vertices,
+            normals: exact_attribute(data.normals, vertex_count),
+            tangents,
+            colors: exact_attribute(data.colors, vertex_count),
+            tex_coords: data
+                .uv_sets
+                .into_iter()
+                .next()
+                .filter(|values| values.len() == vertex_count)
+                .unwrap_or_default(),
+            indices,
+            material,
+        };
+        self.scene.statistics.source_meshes += 1;
+        self.scene.statistics.source_vertices += mesh.positions.len();
+        self.scene.statistics.source_triangles += mesh.indices.len() / 3;
+        Ok(Some(self.push_node(
+            block_index,
+            &geometry.base,
+            Some(mesh),
+        )))
+    }
+
+    fn extract_material(
+        &mut self,
+        block_index: usize,
+        geometry: &Geometry,
+    ) -> Result<Option<usize>, SceneError> {
+        let mut material_property = None;
+        let mut alpha_property = None;
+        let mut pp_shader = None;
+        let mut no_lighting = None;
+
+        for &property in &geometry.base.properties {
+            if property < 0 {
+                continue;
+            }
+            let property = self.reference(block_index, property, "property")?;
+            match self.decode(property)? {
+                TypedBlock::MaterialProperty(value) => material_property = Some(value),
+                TypedBlock::AlphaProperty(value) => alpha_property = Some(value),
+                TypedBlock::PpLightingProperty(value) => pp_shader = Some(value),
+                TypedBlock::NoLightingProperty(value) => no_lighting = Some(value),
+                TypedBlock::Unsupported => {}
+                _ => {}
+            }
+        }
+
+        if material_property.is_none()
+            && alpha_property.is_none()
+            && pp_shader.is_none()
+            && no_lighting.is_none()
+        {
+            return Ok(None);
+        }
+
+        let textures = match pp_shader.as_ref().map(|shader| shader.texture_set) {
+            Some(reference) if reference >= 0 => {
+                let texture_set = self.reference(block_index, reference, "shader texture set")?;
+                match self.decode(texture_set)? {
+                    TypedBlock::ShaderTextureSet(value) => Some(value),
+                    _ => {
+                        self.issue(
+                            texture_set,
+                            "shader texture set has an unsupported type".into(),
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let material = make_material(
+            geometry,
+            material_property.as_ref(),
+            alpha_property.as_ref(),
+            pp_shader.as_ref(),
+            no_lighting.as_ref(),
+            textures.as_ref(),
+        );
+        self.scene.materials.push(material);
+        Ok(Some(self.scene.materials.len() - 1))
+    }
+
+    fn push_node(
+        &mut self,
+        block_index: usize,
+        object: &AvObject,
+        mesh: Option<SceneMesh>,
+    ) -> usize {
+        let scene_index = self.scene.nodes.len();
+        self.scene.nodes.push(SceneNode {
+            source_block: block_index,
+            name: object.object.name.clone().unwrap_or_else(|| {
+                format!(
+                    "{}#{block_index}",
+                    self.document.blocks[block_index].type_name
+                )
+            }),
+            transform: object.transform,
+            children: Vec::new(),
+            mesh,
+        });
+        self.node_by_block.insert(block_index, scene_index);
+        scene_index
+    }
+
+    fn decode(&self, block: usize) -> Result<TypedBlock, SceneError> {
+        self.document
+            .decode_block(block)
+            .map_err(|error| SceneError::Decode {
+                block,
+                message: error.to_string(),
+            })
+    }
+
+    fn reference(
+        &self,
+        source_block: usize,
+        reference: i32,
+        field: &'static str,
+    ) -> Result<usize, SceneError> {
+        if reference < 0 {
+            return Err(SceneError::InvalidBlockReference {
+                source_block,
+                field,
+                reference,
+                block_count: self.document.blocks.len(),
+            });
+        }
+        let reference = reference as usize;
+        self.block(source_block, reference, field)?;
+        Ok(reference)
+    }
+
+    fn block(
+        &self,
+        source_block: usize,
+        reference: usize,
+        field: &'static str,
+    ) -> Result<&super::RawBlock, SceneError> {
+        self.document
+            .blocks
+            .get(reference)
+            .ok_or(SceneError::InvalidBlockReference {
+                source_block,
+                field,
+                reference: reference as i32,
+                block_count: self.document.blocks.len(),
+            })
+    }
+
+    fn issue(&mut self, source_block: usize, message: String) {
+        let type_name = self
+            .document
+            .blocks
+            .get(source_block)
+            .map(|block| block.type_name.clone())
+            .unwrap_or_else(|| "<missing>".into());
+        self.scene.issues.push(SceneIssue {
+            source_block,
+            type_name,
+            message,
+        });
+    }
+}
+
+fn exact_attribute<T>(values: Vec<T>, vertex_count: usize) -> Vec<T> {
+    if values.len() == vertex_count {
+        values
+    } else {
+        Vec::new()
+    }
+}
+
+fn tangents(data: &GeometryData) -> Vec<[f32; 4]> {
+    if data.tangents.len() != data.vertices.len()
+        || data.bitangents.len() != data.vertices.len()
+        || data.normals.len() != data.vertices.len()
+    {
+        return Vec::new();
+    }
+    data.tangents
+        .iter()
+        .zip(&data.bitangents)
+        .zip(&data.normals)
+        .map(|((&tangent, &bitangent), &normal)| {
+            let cross = [
+                normal[1] * tangent[2] - normal[2] * tangent[1],
+                normal[2] * tangent[0] - normal[0] * tangent[2],
+                normal[0] * tangent[1] - normal[1] * tangent[0],
+            ];
+            let handedness = if cross[0] * bitangent[0]
+                + cross[1] * bitangent[1]
+                + cross[2] * bitangent[2]
+                < 0.0
+            {
+                -1.0
+            } else {
+                1.0
+            };
+            [tangent[0], tangent[1], tangent[2], handedness]
+        })
+        .collect()
+}
+
+fn triangulate_strips(data: &TriStripsData) -> Vec<[u16; 3]> {
+    let mut triangles = Vec::with_capacity(data.geometry.triangle_count as usize);
+    for strip in &data.strips {
+        for (offset, window) in strip.windows(3).enumerate() {
+            let triangle = if offset % 2 == 0 {
+                [window[0], window[1], window[2]]
+            } else {
+                [window[1], window[0], window[2]]
+            };
+            if triangle[0] != triangle[1]
+                && triangle[1] != triangle[2]
+                && triangle[0] != triangle[2]
+            {
+                triangles.push(triangle);
+            }
+        }
+    }
+    triangles
+}
+
+fn make_material(
+    geometry: &Geometry,
+    material: Option<&MaterialProperty>,
+    alpha: Option<&AlphaProperty>,
+    _pp_shader: Option<&PpLightingProperty>,
+    no_lighting: Option<&NoLightingProperty>,
+    textures: Option<&ShaderTextureSet>,
+) -> SceneMaterial {
+    let name = geometry
+        .materials
+        .names
+        .get(usize::try_from(geometry.materials.active).unwrap_or(usize::MAX))
+        .and_then(|value| value.clone())
+        .or_else(|| material.and_then(|value| value.object.name.clone()))
+        .unwrap_or_else(|| "Material".into());
+    let alpha_value = material.map_or(1.0, |value| value.alpha.clamp(0.0, 1.0));
+    let (alpha_mode, alpha_cutoff) = match alpha {
+        Some(value) if value.flags & 0x0200 != 0 => (
+            SceneAlphaMode::Mask,
+            Some(f32::from(value.threshold) / 255.0),
+        ),
+        Some(value) if value.flags & 0x0001 != 0 => (SceneAlphaMode::Blend, None),
+        _ if alpha_value < 1.0 => (SceneAlphaMode::Blend, None),
+        _ => (SceneAlphaMode::Opaque, None),
+    };
+    let texture = |slot: usize| {
+        textures
+            .and_then(|value| value.textures.get(slot))
+            .map(|path| normalize_texture_path(path))
+            .filter(|path| !path.is_empty())
+    };
+    SceneMaterial {
+        name,
+        base_color: [1.0, 1.0, 1.0, alpha_value],
+        emissive: material.map_or([0.0; 3], |value| value.emissive),
+        emissive_multiplier: material.map_or(1.0, |value| value.emissive_multiplier.max(0.0)),
+        roughness: material.map_or(1.0, |value| {
+            (1.0 - value.glossiness / 100.0).clamp(0.0, 1.0)
+        }),
+        alpha_mode,
+        alpha_cutoff,
+        double_sided: false,
+        unlit: no_lighting.is_some(),
+        diffuse_texture: no_lighting
+            .map(|value| normalize_texture_path(&value.file_name))
+            .filter(|path| !path.is_empty())
+            .or_else(|| texture(0)),
+        normal_texture: texture(1),
+        glow_texture: texture(2),
+    }
+}
+
+pub fn normalize_texture_path(path: &str) -> String {
+    path.trim_matches('\0')
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triangle_strips_alternate_winding_and_drop_degenerates() {
+        let data = TriStripsData {
+            geometry: GeometryData {
+                group_id: 0,
+                vertices: vec![[0.0; 3]; 5],
+                keep_flags: 0,
+                compress_flags: 0,
+                data_flags: 0,
+                normals: Vec::new(),
+                tangents: Vec::new(),
+                bitangents: Vec::new(),
+                bound_center: [0.0; 3],
+                bound_radius: 0.0,
+                colors: Vec::new(),
+                uv_sets: Vec::new(),
+                consistency_flags: 0,
+                additional_data: -1,
+                triangle_count: 2,
+            },
+            strips: vec![vec![0, 1, 2, 3], vec![3, 3, 4]],
+        };
+        assert_eq!(triangulate_strips(&data), [[0, 1, 2], [2, 1, 3]]);
+    }
+
+    #[test]
+    fn texture_paths_are_canonical_and_portable() {
+        assert_eq!(
+            normalize_texture_path("\\Textures\\Clutter\\Desk.DDS\0"),
+            "textures/clutter/desk.dds"
+        );
+    }
+}

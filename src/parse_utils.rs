@@ -63,30 +63,24 @@ pub fn parse_version() -> BinResult<u32> {
 
 #[binrw::parser(reader)]
 pub fn parse_lf_terminated_string() -> BinResult<String> {
-    Ok(String::from_utf8_lossy(
-        reader
-            .bytes()
-            .filter_map(Result::ok)
-            .take_while(|&b| b != b'\n')
-            .collect::<Vec<u8>>()
-            .as_slice(),
-    )
-    .to_string())
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    while reader.read(&mut byte)? == 1 {
+        if byte[0] == b'\n' {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 #[binrw::parser(reader, endian)]
 pub fn parse_int_prefixed_string() -> BinResult<String> {
     let count = u32::read_options(reader, endian, ())?;
 
-    Ok(String::from_utf8_lossy(
-        reader
-            .bytes()
-            .take(count as usize)
-            .filter_map(Result::ok)
-            .collect::<Vec<u8>>()
-            .as_slice(),
-    )
-    .to_string())
+    let mut bytes = Vec::new();
+    reader.take(count as u64).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 #[binrw::parser(reader, endian)]

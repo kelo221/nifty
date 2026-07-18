@@ -7,7 +7,7 @@ categories = []
 description = "A super-primitive Gamebryo NIF parser targeting version 20.0.0.4"
 homepage = "https://github.com/amPerl/nif"
 repository = "https://github.com/amPerl/nif"
-license = "MIT"
+license = "GPL-3.0-only"
 readme = "README.md"
 exclude = ["tests/*"]
 
@@ -20,14 +20,18 @@ name = "nif2gltf"
 required-features = ["gltf_export"]
 
 [features]
-default = ["obj_export", "gltf_export"]
+default = ["obj_export", "gltf_export", "fo3_glb"]
 obj_export = []
 gltf_export = ["gltf", "gltf-json"]
+fo3_glb = ["gltf_export", "dep:image", "dep:serde_json"]
 
 [dependencies]
 anyhow = "1.0.72"
 thiserror = "1.0.43"
 glam = "0.28.0"
-gltf = { version = "1.4.1", optional = true }
-gltf-json = { version = "1.4.1", optional = true }
+half = "2.7"
+gltf = { version = "1.4.1", optional = true, features = ["names", "extras", "KHR_materials_unlit", "KHR_materials_emissive_strength"] }
+gltf-json = { version = "1.4.1", optional = true, features = ["names", "extras", "KHR_materials_unlit", "KHR_materials_emissive_strength"] }
+image = { version = "0.25.10", default-features = false, features = ["dds", "png"], optional = true }
+serde_json = { version = "1.0", features = ["raw_value"], optional = true }
 binrw = "0.14.0"

@@ -599,7 +599,7 @@ impl Gltf {
                 let mut buffer_offset = buffer_vec.len();
                 buffer_vec.reserve(buffer_capacity);
 
-                if buffer_offset % 4 != 0 {
+                if !buffer_offset.is_multiple_of(4) {
                     let extra_alloc = 4 - (buffer_offset % 4);
                     buffer_vec.reserve(extra_alloc);
                     buffer_vec

@@ -8,6 +8,7 @@ pub mod blocks;
 pub mod collectors;
 pub mod common;
 pub mod error;
+pub mod fo3;
 pub mod header;
 
 pub use glam;
