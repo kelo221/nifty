@@ -153,6 +153,12 @@ pub enum ActorSceneMergeError {
     InvalidRestTransform { node: String },
 }
 
+/// Merges a visual actor part onto `actor`'s shared skeleton.
+///
+/// Joint node indices are remapped by normalized bone name, but the part's
+/// authored inverse bind matrices are retained. Bethesda actor-part skin data
+/// uses a part-local bind space which cannot be reconstructed solely from the
+/// shared skeleton hierarchy without visibly deforming the intact mesh.
 pub fn merge_actor_scene(actor: &mut Scene, part: &Scene) -> Result<(), ActorSceneMergeError> {
     let mut merged = actor.clone();
     merge_actor_scene_inner(&mut merged, part)?;
@@ -160,6 +166,11 @@ pub fn merge_actor_scene(actor: &mut Scene, part: &Scene) -> Result<(), ActorSce
     Ok(())
 }
 
+/// Rebuilds inverse bind matrices from scene-node rest transforms.
+///
+/// This is suitable for synthetic scenes whose mesh bind space is exactly the
+/// scene-node hierarchy. Do not apply it after [`merge_actor_scene`]: imported
+/// Bethesda actor parts carry authoritative part-local matrices.
 pub fn recalculate_actor_inverse_bind_matrices(
     actor: &mut Scene,
 ) -> Result<(), ActorSceneMergeError> {
@@ -1569,5 +1580,84 @@ mod tests {
             normalize_texture_path("\\Textures\\Clutter\\Desk.DDS\0"),
             "textures/clutter/desk.dds"
         );
+    }
+
+    fn identity_transform() -> Transform {
+        Transform {
+            translation: [0.0; 3],
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            scale: 1.0,
+        }
+    }
+
+    fn empty_scene(nodes: Vec<SceneNode>, roots: Vec<usize>) -> Scene {
+        Scene {
+            nodes,
+            roots,
+            materials: Vec::new(),
+            skins: Vec::new(),
+            issues: Vec::new(),
+            statistics: SceneStatistics::default(),
+            animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn actor_merge_preserves_authoritative_part_inverse_bind_matrices() {
+        let node = |name: &str, children: Vec<usize>| SceneNode {
+            source_block: 0,
+            name: name.into(),
+            transform: identity_transform(),
+            children,
+            mesh: None,
+            skin: None,
+        };
+        let mut actor = empty_scene(
+            vec![node("Scene Root", vec![1]), node("Bip01 Spine", Vec::new())],
+            vec![0],
+        );
+        let mesh = SceneMesh {
+            name: "Outfit".into(),
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: Vec::new(),
+            tangents: Vec::new(),
+            colors: Vec::new(),
+            tex_coords: Vec::new(),
+            joints: vec![[0, 0, 0, 0]; 3],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+            indices: vec![0, 1, 2],
+            material: None,
+        };
+        let mut part = empty_scene(
+            vec![
+                node("Scene Root", vec![1, 2]),
+                node("Bip01 Spine", Vec::new()),
+                SceneNode {
+                    source_block: 2,
+                    name: "Outfit".into(),
+                    transform: identity_transform(),
+                    children: Vec::new(),
+                    mesh: Some(mesh),
+                    skin: Some(0),
+                },
+            ],
+            vec![0],
+        );
+        let authored = Mat4::from_translation(Vec3::new(3.0, 5.0, 7.0)).to_cols_array();
+        part.skins.push(SceneSkin {
+            name: "Outfit Skin".into(),
+            joints: vec![1],
+            inverse_bind_matrices: vec![authored],
+            skeleton: Some(0),
+        });
+
+        merge_actor_scene(&mut actor, &part).unwrap();
+
+        assert_eq!(actor.skins.len(), 1);
+        assert_eq!(actor.skins[0].joints, vec![1]);
+        assert_eq!(actor.skins[0].skeleton, Some(0));
+        assert_eq!(actor.skins[0].inverse_bind_matrices, vec![authored]);
+        assert_eq!(actor.nodes[2].skin, Some(0));
     }
 }
