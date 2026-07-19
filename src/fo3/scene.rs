@@ -151,6 +151,8 @@ pub enum ActorSceneMergeError {
     MissingSkeletonRoot { root: String },
     #[error("actor scene has an invalid rest transform at node {node:?}")]
     InvalidRestTransform { node: String },
+    #[error("actor attachment node {attachment:?} is absent from the shared skeleton")]
+    MissingAttachment { attachment: String },
 }
 
 /// Merges a visual actor part onto `actor`'s shared skeleton.
@@ -161,7 +163,26 @@ pub enum ActorSceneMergeError {
 /// shared skeleton hierarchy without visibly deforming the intact mesh.
 pub fn merge_actor_scene(actor: &mut Scene, part: &Scene) -> Result<(), ActorSceneMergeError> {
     let mut merged = actor.clone();
-    merge_actor_scene_inner(&mut merged, part)?;
+    merge_actor_scene_inner(&mut merged, part, None)?;
+    *actor = merged;
+    Ok(())
+}
+
+/// Merges a visual actor part whose independent roots are authored in the
+/// local space of a shared skeleton node.
+///
+/// FO3 head accessories such as hair and eyes are separate NIFs. Their roots
+/// have head-local coordinates, so treating those roots as actor roots leaves
+/// the geometry at the actor origin. Roots that already match a shared node
+/// still reuse that node normally; only newly appended roots are parented to
+/// `attachment`.
+pub fn merge_actor_scene_attached(
+    actor: &mut Scene,
+    part: &Scene,
+    attachment: &str,
+) -> Result<(), ActorSceneMergeError> {
+    let mut merged = actor.clone();
+    merge_actor_scene_inner(&mut merged, part, Some(attachment))?;
     *actor = merged;
     Ok(())
 }
@@ -255,8 +276,27 @@ fn actor_global_transform(
     Ok(global)
 }
 
-fn merge_actor_scene_inner(actor: &mut Scene, part: &Scene) -> Result<(), ActorSceneMergeError> {
+fn merge_actor_scene_inner(
+    actor: &mut Scene,
+    part: &Scene,
+    attachment: Option<&str>,
+) -> Result<(), ActorSceneMergeError> {
     let shared_node_count = actor.nodes.len();
+    let attachment_node = attachment
+        .map(|attachment| {
+            let key = actor_node_key(attachment);
+            actor
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| {
+                    (node.mesh.is_none() && actor_node_key(&node.name) == key).then_some(index)
+                })
+                .ok_or_else(|| ActorSceneMergeError::MissingAttachment {
+                    attachment: attachment.to_owned(),
+                })
+        })
+        .transpose()?;
     let material_offset = actor.materials.len();
     actor.materials.extend(part.materials.iter().cloned());
 
@@ -360,11 +400,14 @@ fn merge_actor_scene_inner(actor: &mut Scene, part: &Scene) -> Result<(), ActorS
             continue;
         }
         if let Some(&root) = node_map.get(root) {
-            if root != usize::MAX
-                && !actor.roots.contains(&root)
-                && !actor.nodes.iter().any(|node| node.children.contains(&root))
-            {
-                actor.roots.push(root);
+            if root != usize::MAX && !actor.nodes.iter().any(|node| node.children.contains(&root)) {
+                if let Some(attachment_node) = attachment_node {
+                    if !actor.nodes[attachment_node].children.contains(&root) {
+                        actor.nodes[attachment_node].children.push(root);
+                    }
+                } else if !actor.roots.contains(&root) {
+                    actor.roots.push(root);
+                }
             }
         }
     }
@@ -1659,5 +1702,55 @@ mod tests {
         assert_eq!(actor.skins[0].skeleton, Some(0));
         assert_eq!(actor.skins[0].inverse_bind_matrices, vec![authored]);
         assert_eq!(actor.nodes[2].skin, Some(0));
+    }
+
+    #[test]
+    fn actor_merge_attaches_head_local_roots_to_the_shared_head_bone() {
+        let node = |name: &str, children: Vec<usize>| SceneNode {
+            source_block: 0,
+            name: name.into(),
+            transform: identity_transform(),
+            children,
+            mesh: None,
+            skin: None,
+        };
+        let mut actor = empty_scene(
+            vec![node("Scene Root", vec![1]), node("Bip01 Head", Vec::new())],
+            vec![0],
+        );
+        let hair = SceneMesh {
+            name: "NoHat".into(),
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: Vec::new(),
+            tangents: Vec::new(),
+            colors: Vec::new(),
+            tex_coords: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: vec![0, 1, 2],
+            material: None,
+        };
+        let part = empty_scene(
+            vec![
+                node("HairBase", vec![1]),
+                SceneNode {
+                    source_block: 1,
+                    name: "NoHat".into(),
+                    transform: identity_transform(),
+                    children: Vec::new(),
+                    mesh: Some(hair),
+                    skin: None,
+                },
+            ],
+            vec![0],
+        );
+
+        merge_actor_scene_attached(&mut actor, &part, "Bip01 Head").unwrap();
+
+        assert_eq!(actor.roots, vec![0]);
+        assert_eq!(actor.nodes[1].children, vec![2]);
+        assert_eq!(actor.nodes[2].name, "HairBase");
+        assert_eq!(actor.nodes[2].children, vec![3]);
+        assert_eq!(actor.nodes[3].name, "NoHat");
     }
 }
