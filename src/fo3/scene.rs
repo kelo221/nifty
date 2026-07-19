@@ -187,6 +187,80 @@ pub fn merge_actor_scene_attached(
     Ok(())
 }
 
+/// Merges a head-local part under an animated skeleton node while preserving
+/// the rest-space frame authored by an already-merged head mesh.
+///
+/// FO3's face-part vertices use the local coordinates of `frame`, but `frame`
+/// is a skinned mesh node rather than the animated bone that should own rigid
+/// hair/eye/mouth roots. The correction from `attachment` to `frame` keeps the
+/// part aligned in the rest pose and lets it follow the attachment bone later.
+pub fn merge_actor_scene_attached_to_frame(
+    actor: &mut Scene,
+    part: &Scene,
+    attachment: &str,
+    frame: &str,
+) -> Result<(), ActorSceneMergeError> {
+    let mut merged = actor.clone();
+    let attachment_key = actor_node_key(attachment);
+    let frame_key = actor_node_key(frame);
+    let attachment_node = merged
+        .nodes
+        .iter()
+        .enumerate()
+        .find_map(|(index, node)| {
+            (node.mesh.is_none() && actor_node_key(&node.name) == attachment_key).then_some(index)
+        })
+        .ok_or_else(|| ActorSceneMergeError::MissingAttachment {
+            attachment: attachment.to_owned(),
+        })?;
+    let frame_node = merged
+        .nodes
+        .iter()
+        .enumerate()
+        .find_map(|(index, node)| (actor_node_key(&node.name) == frame_key).then_some(index))
+        .ok_or_else(|| ActorSceneMergeError::MissingAttachment {
+            attachment: frame.to_owned(),
+        })?;
+
+    let mut parents = vec![None; merged.nodes.len()];
+    for (parent, node) in merged.nodes.iter().enumerate() {
+        for &child in &node.children {
+            if let Some(slot) = parents.get_mut(child) {
+                *slot = Some(parent);
+            }
+        }
+    }
+    let mut globals = vec![None; merged.nodes.len()];
+    let mut visiting = HashSet::new();
+    let attachment_global = actor_global_transform(
+        &merged,
+        &parents,
+        &mut globals,
+        &mut visiting,
+        attachment_node,
+    )?;
+    let frame_global =
+        actor_global_transform(&merged, &parents, &mut globals, &mut visiting, frame_node)?;
+    let correction = attachment_global.inverse() * frame_global;
+    if !correction.is_finite() {
+        return Err(ActorSceneMergeError::InvalidRestTransform {
+            node: frame.to_owned(),
+        });
+    }
+
+    let mut rebased = part.clone();
+    for &root in &part.roots {
+        let Some(node) = rebased.nodes.get_mut(root) else {
+            continue;
+        };
+        let local = Mat4::from_cols_array(&transform_matrix(&node.transform));
+        node.transform = transform_from_matrix(correction * local, &node.name)?;
+    }
+    merge_actor_scene_inner(&mut merged, &rebased, Some(attachment))?;
+    *actor = merged;
+    Ok(())
+}
+
 /// Rebuilds inverse bind matrices from scene-node rest transforms.
 ///
 /// This is suitable for synthetic scenes whose mesh bind space is exactly the
@@ -1278,6 +1352,26 @@ fn transform_matrix(transform: &Transform) -> [f32; 16] {
     .to_cols_array()
 }
 
+fn transform_from_matrix(matrix: Mat4, node: &str) -> Result<Transform, ActorSceneMergeError> {
+    let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
+    let uniform_scale = (scale.x + scale.y + scale.z) / 3.0;
+    if !matrix.is_finite()
+        || !rotation.is_finite()
+        || !translation.is_finite()
+        || !uniform_scale.is_finite()
+        || (scale - Vec3::splat(uniform_scale)).abs().max_element() > 1.0e-4
+    {
+        return Err(ActorSceneMergeError::InvalidRestTransform {
+            node: node.to_owned(),
+        });
+    }
+    Ok(Transform {
+        translation: translation.to_array(),
+        rotation: Mat3::from_quat(rotation).transpose().to_cols_array(),
+        scale: uniform_scale,
+    })
+}
+
 fn exact_attribute<T>(values: Vec<T>, vertex_count: usize) -> Vec<T> {
     if values.len() == vertex_count {
         values
@@ -1752,5 +1846,59 @@ mod tests {
         assert_eq!(actor.nodes[2].name, "HairBase");
         assert_eq!(actor.nodes[2].children, vec![3]);
         assert_eq!(actor.nodes[3].name, "NoHat");
+    }
+
+    #[test]
+    fn actor_merge_rebases_head_local_roots_through_the_authored_head_frame() {
+        let node = |name: &str, children: Vec<usize>, translation: [f32; 3]| SceneNode {
+            source_block: 0,
+            name: name.into(),
+            transform: Transform {
+                translation,
+                ..identity_transform()
+            },
+            children,
+            mesh: None,
+            skin: None,
+        };
+        let triangle = SceneMesh {
+            name: "Triangle".into(),
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: Vec::new(),
+            tangents: Vec::new(),
+            colors: Vec::new(),
+            tex_coords: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: vec![0, 1, 2],
+            material: None,
+        };
+        let mut actor = empty_scene(
+            vec![
+                node("Scene Root", vec![1, 2], [0.0, 0.0, 0.0]),
+                node("Bip01 Head", Vec::new(), [0.0, 0.0, 100.0]),
+                SceneNode {
+                    mesh: Some(triangle.clone()),
+                    ..node("HeadMale", Vec::new(), [0.0, 0.0, 110.0])
+                },
+            ],
+            vec![0],
+        );
+        let part = empty_scene(
+            vec![
+                node("HairBase", vec![1], [0.0, 0.0, 0.0]),
+                SceneNode {
+                    mesh: Some(triangle),
+                    ..node("NoHat", Vec::new(), [0.0, 0.0, 0.0])
+                },
+            ],
+            vec![0],
+        );
+
+        merge_actor_scene_attached_to_frame(&mut actor, &part, "Bip01 Head", "HeadMale").unwrap();
+
+        assert_eq!(actor.nodes[1].children, vec![3]);
+        assert_eq!(actor.nodes[3].name, "HairBase");
+        assert_eq!(actor.nodes[3].transform.translation, [0.0, 0.0, 10.0]);
     }
 }
