@@ -30,6 +30,7 @@ pub const SHADER_FLAG2_BACK_LIGHTING: u32 = 1 << 27;
 /// Scale them at export so the GLB and baked irradiance use the same restrained
 /// HDR contribution in Bevy's additive-bloom pipeline.
 pub const FALLOUT_EMISSIVE_SCALE: f32 = 0.25;
+pub const FALLOUT_EMISSIVE_MAX: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FalloutShaderFeatures {

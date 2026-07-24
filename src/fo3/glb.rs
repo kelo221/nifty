@@ -10,7 +10,8 @@ use json::{
 use thiserror::Error;
 
 use super::{
-    FalloutShaderFeatures, FALLOUT_EMISSIVE_SCALE, SHADER_TYPE_HAIR_TINT, SHADER_TYPE_SKIN_TINT,
+    FalloutShaderFeatures, FALLOUT_EMISSIVE_MAX, FALLOUT_EMISSIVE_SCALE, SHADER_TYPE_HAIR_TINT,
+    SHADER_TYPE_SKIN_TINT,
 };
 use super::{
     Scene, SceneAlphaMode, SceneAnimation, SceneAnimationChannel, SceneMaterial, SceneMesh,
@@ -484,6 +485,8 @@ impl Writer<'_> {
             source.shader_flags_1,
             source.shader_flags_2,
         );
+        let emissive_multiplier =
+            (source.emissive_multiplier * FALLOUT_EMISSIVE_SCALE).clamp(0.0, FALLOUT_EMISSIVE_MAX);
         let translucency_strength = if features.back_lighting {
             0.35
         } else if features.soft_lighting {
@@ -502,55 +505,57 @@ impl Writer<'_> {
             extensions: None,
             extras: Default::default(),
         };
-        let extensions = (source.unlit || source.emissive_multiplier > 1.0 || specular.is_some())
-            .then(|| {
-                if source.unlit
-                    && !self
-                        .root
-                        .extensions_used
-                        .iter()
-                        .any(|value| value == "KHR_materials_unlit")
-                {
-                    self.root.extensions_used.push("KHR_materials_unlit".into());
-                }
-                if source.emissive_multiplier > 1.0
-                    && !self
-                        .root
-                        .extensions_used
-                        .iter()
-                        .any(|value| value == "KHR_materials_emissive_strength")
-                {
-                    self.root
-                        .extensions_used
-                        .push("KHR_materials_emissive_strength".into());
-                }
-                if specular.is_some()
-                    && !self
-                        .root
-                        .extensions_used
-                        .iter()
-                        .any(|value| value == "KHR_materials_specular")
-                {
-                    self.root
-                        .extensions_used
-                        .push("KHR_materials_specular".into());
-                }
-                json::extensions::material::Material {
-                    unlit: source.unlit.then_some(json::extensions::material::Unlit {}),
-                    emissive_strength: (source.emissive_multiplier > 1.0).then_some(
-                        json::extensions::material::EmissiveStrength {
-                            emissive_strength: json::extensions::material::EmissiveStrengthFactor(
-                                source.emissive_multiplier,
-                            ),
-                        },
-                    ),
-                    specular: specular.map(|index| json::extensions::material::Specular {
-                        specular_texture: Some(texture_info(index)),
-                        ..Default::default()
-                    }),
+        let extensions = (source.unlit
+            || (emissive_multiplier - 1.0).abs() > f32::EPSILON
+            || specular.is_some())
+        .then(|| {
+            if source.unlit
+                && !self
+                    .root
+                    .extensions_used
+                    .iter()
+                    .any(|value| value == "KHR_materials_unlit")
+            {
+                self.root.extensions_used.push("KHR_materials_unlit".into());
+            }
+            if (emissive_multiplier - 1.0).abs() > f32::EPSILON
+                && !self
+                    .root
+                    .extensions_used
+                    .iter()
+                    .any(|value| value == "KHR_materials_emissive_strength")
+            {
+                self.root
+                    .extensions_used
+                    .push("KHR_materials_emissive_strength".into());
+            }
+            if specular.is_some()
+                && !self
+                    .root
+                    .extensions_used
+                    .iter()
+                    .any(|value| value == "KHR_materials_specular")
+            {
+                self.root
+                    .extensions_used
+                    .push("KHR_materials_specular".into());
+            }
+            json::extensions::material::Material {
+                unlit: source.unlit.then_some(json::extensions::material::Unlit {}),
+                emissive_strength: ((emissive_multiplier - 1.0).abs() > f32::EPSILON).then_some(
+                    json::extensions::material::EmissiveStrength {
+                        emissive_strength: json::extensions::material::EmissiveStrengthFactor(
+                            emissive_multiplier,
+                        ),
+                    },
+                ),
+                specular: specular.map(|index| json::extensions::material::Specular {
+                    specular_texture: Some(texture_info(index)),
                     ..Default::default()
-                }
-            });
+                }),
+                ..Default::default()
+            }
+        });
         Ok(json::Material {
             alpha_cutoff: source.alpha_cutoff.map(material::AlphaCutoff),
             alpha_mode: Valid(match source.alpha_mode {
@@ -578,11 +583,7 @@ impl Writer<'_> {
             }),
             occlusion_texture: None,
             emissive_texture: glow.map(texture_info),
-            emissive_factor: material::EmissiveFactor([
-                source.emissive[0] * FALLOUT_EMISSIVE_SCALE,
-                source.emissive[1] * FALLOUT_EMISSIVE_SCALE,
-                source.emissive[2] * FALLOUT_EMISSIVE_SCALE,
-            ]),
+            emissive_factor: material::EmissiveFactor(source.emissive),
             extensions,
             extras: extras(serde_json::json!({
                 "bevyout_fallout_material": {
@@ -604,7 +605,9 @@ impl Writer<'_> {
                     "translucency_enabled": features.translucent_candidate,
                     "translucency_strength": translucency_strength,
                     "emissive_multiplier": source.emissive_multiplier,
+                    "emissive_multiplier_effective": emissive_multiplier,
                     "emissive_scale": FALLOUT_EMISSIVE_SCALE,
+                    "emissive_max": FALLOUT_EMISSIVE_MAX,
                     "environment_texture": source.environment_texture,
                     "environment_mask": source.environment_mask,
                     "height_texture": source.height_texture,
@@ -1075,7 +1078,12 @@ mod tests {
         );
         assert_eq!(
             document["materials"][0]["emissiveFactor"],
-            serde_json::json!([0.2, 0.1, 0.05])
+            serde_json::json!([0.8, 0.4, 0.2])
+        );
+        assert_eq!(
+            document["materials"][0]["extensions"]["KHR_materials_emissive_strength"]
+                ["emissiveStrength"],
+            serde_json::json!(0.25)
         );
         assert_eq!(
             gltf.document.materials().next().unwrap().alpha_mode(),
