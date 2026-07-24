@@ -474,19 +474,33 @@ impl Writer<'_> {
             .map(|path| self.texture(path))
             .transpose()?
             .flatten();
-        let glow = source
-            .glow_texture
-            .as_deref()
-            .map(|path| self.texture(path))
-            .transpose()?
-            .flatten();
         let features = FalloutShaderFeatures::from_flags(
             source.shader_type,
             source.shader_flags_1,
             source.shader_flags_2,
         );
-        let emissive_multiplier =
-            (source.emissive_multiplier * FALLOUT_EMISSIVE_SCALE).clamp(0.0, FALLOUT_EMISSIVE_MAX);
+        let glow = source
+            .glow_texture
+            .as_deref()
+            .filter(|_| features.glow_map)
+            .map(|path| self.texture(path))
+            .transpose()?
+            .flatten();
+        // Fallout's environment-map shader is not an emissive shader.  The
+        // NIF material can still carry a nonzero authored emissive color (and
+        // an adjacent `_g` texture), but those values are not authoritative
+        // unless the shader flags actually enable the glow map feature.
+        let emission_authorized = features.glow_map;
+        let emissive_multiplier = if emission_authorized {
+            (source.emissive_multiplier * FALLOUT_EMISSIVE_SCALE).clamp(0.0, FALLOUT_EMISSIVE_MAX)
+        } else {
+            1.0
+        };
+        let emissive_factor = if emission_authorized {
+            source.emissive
+        } else {
+            [0.0; 3]
+        };
         let translucency_strength = if features.back_lighting {
             0.35
         } else if features.soft_lighting {
@@ -583,7 +597,7 @@ impl Writer<'_> {
             }),
             occlusion_texture: None,
             emissive_texture: glow.map(texture_info),
-            emissive_factor: material::EmissiveFactor(source.emissive),
+            emissive_factor: material::EmissiveFactor(emissive_factor),
             extensions,
             extras: extras(serde_json::json!({
                 "bevyout_fallout_material": {
@@ -602,6 +616,7 @@ impl Writer<'_> {
                         "soft_lighting": features.soft_lighting,
                         "back_lighting": features.back_lighting,
                     },
+                    "emission_authorized": emission_authorized,
                     "translucency_enabled": features.translucent_candidate,
                     "translucency_strength": translucency_strength,
                     "emissive_multiplier": source.emissive_multiplier,
@@ -1099,6 +1114,86 @@ mod tests {
             .expect("decode embedded PNG")
             .to_rgba8();
         assert!(image.pixels().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn environment_map_radaway_is_not_emissive_without_glow_semantics() {
+        let diffuse_path = "textures/clutter/health/radaway01.dds";
+        let normal_path = "textures/clutter/food/bloodpack_n.dds";
+        let scene = Scene {
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            materials: vec![SceneMaterial {
+                name: "RadAway".into(),
+                base_color: [1.0, 1.0, 1.0, 0.5],
+                emissive: [0.43529415, 0.24705884, 0.0],
+                emissive_multiplier: 1.5,
+                roughness: 0.6812779,
+                alpha_mode: SceneAlphaMode::Blend,
+                alpha_cutoff: None,
+                double_sided: false,
+                unlit: false,
+                diffuse_texture: Some(diffuse_path.into()),
+                normal_texture: Some(normal_path.into()),
+                specular_texture: None,
+                glow_texture: Some("textures/clutter/health/radaway01_g.dds".into()),
+                height_texture: None,
+                environment_texture: None,
+                environment_mask: None,
+                shader_type: super::super::SHADER_TYPE_ENVIRONMENT_MAP,
+                shader_flags_1: 0,
+                shader_flags_2: 0,
+            }],
+            skins: Vec::new(),
+            issues: Vec::new(),
+            statistics: super::super::SceneStatistics::default(),
+            animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
+        };
+        let mut textures = BTreeMap::new();
+        let texture = dds_block(b"DXT1", 4, 4, &dxt1_block(0, u16::MAX, 0));
+        textures.insert(diffuse_path.into(), texture.clone());
+        textures.insert(normal_path.into(), texture);
+        textures.insert(
+            "textures/clutter/health/radaway01_g.dds".into(),
+            dds_block(b"DXT1", 4, 4, &dxt1_block(u16::MAX, 0, 0)),
+        );
+
+        let output = encode_glb(&scene, &textures, &GlbOptions::default()).expect("encode GLB");
+        let gltf = gltf::Gltf::from_slice(&output.bytes).expect("validate GLB");
+        let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.bytes[20..20 + json_length]).unwrap();
+        let material = &document["materials"][0];
+
+        assert_eq!(material["alphaMode"], serde_json::json!("BLEND"));
+        assert!(material["pbrMetallicRoughness"]["baseColorTexture"].is_object());
+        assert!(material["normalTexture"].is_object());
+        assert_eq!(
+            material["emissiveFactor"],
+            serde_json::json!([0.0, 0.0, 0.0])
+        );
+        assert!(material["emissiveTexture"].is_null());
+        assert!(material["extensions"]["KHR_materials_emissive_strength"].is_null());
+        assert!(!document["extensionsUsed"]
+            .as_array()
+            .is_some_and(|extensions| {
+                extensions
+                    .iter()
+                    .any(|extension| extension == "KHR_materials_emissive_strength")
+            }));
+        assert_eq!(
+            material["extras"]["bevyout_fallout_material"]["features"]["glow_map"],
+            false
+        );
+        assert_eq!(
+            material["extras"]["bevyout_fallout_material"]["emission_authorized"],
+            false
+        );
+        assert_eq!(
+            gltf.document.materials().next().unwrap().alpha_mode(),
+            gltf::material::AlphaMode::Blend
+        );
     }
 
     #[test]
