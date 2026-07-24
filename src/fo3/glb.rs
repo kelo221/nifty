@@ -11,7 +11,8 @@ use thiserror::Error;
 
 use super::{
     FalloutShaderFeatures, FALLOUT_EMISSIVE_MAX, FALLOUT_EMISSIVE_SCALE,
-    SHADER_TYPE_ENVIRONMENT_MAP, SHADER_TYPE_HAIR_TINT, SHADER_TYPE_SKIN_TINT,
+    SHADER_FLAG1_ENVIRONMENT_MAPPING, SHADER_TYPE_ENVIRONMENT_MAP, SHADER_TYPE_HAIR_TINT,
+    SHADER_TYPE_SKIN_TINT,
 };
 use super::{
     Scene, SceneAlphaMode, SceneAnimation, SceneAnimationChannel, SceneMaterial, SceneMesh,
@@ -497,18 +498,21 @@ impl Writer<'_> {
         // physical-bulb relationship before this writer runs.
         //
         // Environment-map materials are not emissive merely because their
-        // NiMaterialProperty contains a nonzero default color. The one
-        // unmasked constant-emission form present in the supported FO3 data
-        // is Nuka-Cola Quantum's explicit high-strength multiplier. An
+        // NiMaterialProperty contains a nonzero default color. A regular
+        // environment-mapping flag plus an authored color is the explicit
+        // light-fixture source used by OffRmLight01/02 and MetLight01b. An
         // unflagged slot-2 source always blocks that fallback, so RadAway's
-        // authored orange value cannot wash its whole mesh yellow.
+        // authored orange value cannot wash its whole mesh yellow. The other
+        // unmasked constant-emission form present in supported FO3 data is
+        // Nuka-Cola Quantum's explicit high-strength multiplier.
         let has_authored_emission = source.emissive.iter().any(|channel| *channel != 0.0);
         let textured_effect_shader = source.unlit && source.diffuse_texture.is_some();
         let effect_shader_fallback = textured_effect_shader && !has_authored_emission;
         let explicit_environment_emission = source.shader_type == SHADER_TYPE_ENVIRONMENT_MAP
             && has_authored_emission
             && source.glow_texture.is_none()
-            && source.emissive_multiplier >= 10.0;
+            && ((source.shader_flags_1 & SHADER_FLAG1_ENVIRONMENT_MAPPING != 0)
+                || source.emissive_multiplier >= 10.0);
         let emission_authorized = features.glow_map
             || textured_effect_shader
             || (has_authored_emission
@@ -1226,6 +1230,66 @@ mod tests {
         assert_eq!(
             gltf.document.materials().next().unwrap().alpha_mode(),
             gltf::material::AlphaMode::Blend
+        );
+    }
+
+    #[test]
+    fn environment_mapped_fixture_preserves_explicit_emission() {
+        let diffuse_path = "textures/dungeons/office/offrmlight01.dds";
+        let scene = Scene {
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            materials: vec![SceneMaterial {
+                name: "OffRmLight02".into(),
+                base_color: [1.0; 4],
+                emissive: [1.0; 3],
+                emissive_multiplier: 1.3,
+                roughness: 0.5,
+                alpha_mode: SceneAlphaMode::Opaque,
+                alpha_cutoff: None,
+                double_sided: false,
+                unlit: false,
+                diffuse_texture: Some(diffuse_path.into()),
+                normal_texture: None,
+                specular_texture: None,
+                glow_texture: None,
+                height_texture: None,
+                environment_texture: Some("textures/effects/shinybright_e.dds".into()),
+                environment_mask: Some("textures/dungeons/office/offrmlight01_m.dds".into()),
+                shader_type: super::super::SHADER_TYPE_ENVIRONMENT_MAP,
+                shader_flags_1: super::super::SHADER_FLAG1_ENVIRONMENT_MAPPING,
+                shader_flags_2: 0,
+            }],
+            skins: Vec::new(),
+            issues: Vec::new(),
+            statistics: super::super::SceneStatistics::default(),
+            animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
+        };
+        let mut textures = BTreeMap::new();
+        textures.insert(
+            diffuse_path.into(),
+            dds_block(b"DXT1", 4, 4, &dxt1_block(0, u16::MAX, 0)),
+        );
+
+        let output = encode_glb(&scene, &textures, &GlbOptions::default())
+            .expect("encode environment-mapped fixture GLB");
+        let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.bytes[20..20 + json_length]).unwrap();
+        let material = &document["materials"][0];
+
+        assert_eq!(
+            material["emissiveFactor"],
+            serde_json::json!([1.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            material["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+            serde_json::json!(0.325)
+        );
+        assert_eq!(
+            material["extras"]["bevyout_fallout_material"]["emission_authorized"],
+            true
         );
     }
 
