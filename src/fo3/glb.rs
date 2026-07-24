@@ -9,7 +9,9 @@ use json::{
 };
 use thiserror::Error;
 
-use super::{FalloutShaderFeatures, SHADER_TYPE_HAIR_TINT, SHADER_TYPE_SKIN_TINT};
+use super::{
+    FalloutShaderFeatures, FALLOUT_EMISSIVE_SCALE, SHADER_TYPE_HAIR_TINT, SHADER_TYPE_SKIN_TINT,
+};
 use super::{
     Scene, SceneAlphaMode, SceneAnimation, SceneAnimationChannel, SceneMaterial, SceneMesh,
     SceneSkin,
@@ -576,7 +578,11 @@ impl Writer<'_> {
             }),
             occlusion_texture: None,
             emissive_texture: glow.map(texture_info),
-            emissive_factor: material::EmissiveFactor(source.emissive),
+            emissive_factor: material::EmissiveFactor([
+                source.emissive[0] * FALLOUT_EMISSIVE_SCALE,
+                source.emissive[1] * FALLOUT_EMISSIVE_SCALE,
+                source.emissive[2] * FALLOUT_EMISSIVE_SCALE,
+            ]),
             extensions,
             extras: extras(serde_json::json!({
                 "bevyout_fallout_material": {
@@ -598,6 +604,7 @@ impl Writer<'_> {
                     "translucency_enabled": features.translucent_candidate,
                     "translucency_strength": translucency_strength,
                     "emissive_multiplier": source.emissive_multiplier,
+                    "emissive_scale": FALLOUT_EMISSIVE_SCALE,
                     "environment_texture": source.environment_texture,
                     "environment_mask": source.environment_mask,
                     "height_texture": source.height_texture,
@@ -1024,7 +1031,7 @@ mod tests {
             materials: vec![SceneMaterial {
                 name: "Cutout".into(),
                 base_color: [1.0; 4],
-                emissive: [0.0; 3],
+                emissive: [0.8, 0.4, 0.2],
                 emissive_multiplier: 1.0,
                 roughness: 1.0,
                 alpha_mode: SceneAlphaMode::Mask,
@@ -1065,6 +1072,10 @@ mod tests {
         assert_eq!(
             document["materials"][0]["extras"]["bevyout_fallout_material"]["features"]["specular"],
             true
+        );
+        assert_eq!(
+            document["materials"][0]["emissiveFactor"],
+            serde_json::json!([0.2, 0.1, 0.05])
         );
         assert_eq!(
             gltf.document.materials().next().unwrap().alpha_mode(),

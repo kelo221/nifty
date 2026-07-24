@@ -26,6 +26,11 @@ pub const SHADER_FLAG2_MULTI_LAYER_PARALLAX: u32 = 1 << 24;
 pub const SHADER_FLAG2_SOFT_LIGHTING: u32 = 1 << 25;
 pub const SHADER_FLAG2_BACK_LIGHTING: u32 = 1 << 27;
 
+/// Fallout glow/emission values are calibrated for the original renderer.
+/// Scale them at export so the GLB and baked irradiance use the same restrained
+/// HDR contribution in Bevy's additive-bloom pipeline.
+pub const FALLOUT_EMISSIVE_SCALE: f32 = 0.25;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FalloutShaderFeatures {
     pub glow_map: bool,
