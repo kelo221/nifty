@@ -491,22 +491,30 @@ impl Writer<'_> {
         // an adjacent `_g` texture), but those values are not authoritative
         // unless the shader flags actually enable the glow map feature.
         // BSEffectShaderProperty is Fallout's explicit unlit/effect source
-        // (used by terminal screens and physical light cards). It is
-        // authoritative even when the material has no slot-2 glow map or
-        // type-2 shader value. If it has no authored emissive color, use the
-        // effect material's base color (and diffuse map, when present) as the
-        // physical bulb source. A constant authored emission is also valid
-        // when an environment-map material has no slot-2 source at all (Nuka
-        // Cola and authored light bulbs). An unflagged slot-2 source blocks
-        // that fallback, so RadAway's authored orange value cannot wash its
-        // whole mesh yellow.
+        // (used by terminal screens). It is authoritative when it has a
+        // source texture; an untextured no-lighting material is not enough to
+        // make a whole prop emit. The native scene pass handles the special
+        // physical-bulb relationship before this writer runs.
+        //
+        // Environment-map materials are not emissive merely because their
+        // NiMaterialProperty contains a nonzero default color. The one
+        // unmasked constant-emission form present in the supported FO3 data
+        // is Nuka-Cola Quantum's explicit high-strength multiplier. An
+        // unflagged slot-2 source always blocks that fallback, so RadAway's
+        // authored orange value cannot wash its whole mesh yellow.
         let has_authored_emission = source.emissive.iter().any(|channel| *channel != 0.0);
-        let effect_shader_fallback = source.unlit && !has_authored_emission;
+        let textured_effect_shader = source.unlit && source.diffuse_texture.is_some();
+        let effect_shader_fallback = textured_effect_shader && !has_authored_emission;
+        let explicit_environment_emission = source.shader_type == SHADER_TYPE_ENVIRONMENT_MAP
+            && has_authored_emission
+            && source.glow_texture.is_none()
+            && source.emissive_multiplier >= 10.0;
         let emission_authorized = features.glow_map
-            || source.unlit
+            || textured_effect_shader
             || (has_authored_emission
+                && !source.unlit
                 && (source.shader_type != SHADER_TYPE_ENVIRONMENT_MAP
-                    || source.glow_texture.is_none()));
+                    || explicit_environment_emission));
         let emissive_multiplier = if emission_authorized {
             (source.emissive_multiplier * FALLOUT_EMISSIVE_SCALE).clamp(0.0, FALLOUT_EMISSIVE_MAX)
         } else {
@@ -1236,7 +1244,7 @@ mod tests {
                 alpha_cutoff: None,
                 double_sided: false,
                 unlit: true,
-                diffuse_texture: None,
+                diffuse_texture: Some("textures/terminals/terminalscreen01.dds".into()),
                 normal_texture: None,
                 specular_texture: None,
                 glow_texture: None,
@@ -1253,7 +1261,12 @@ mod tests {
             animations: Vec::new(),
             animation_sound_cues: Vec::new(),
         };
-        let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
+        let mut textures = BTreeMap::new();
+        textures.insert(
+            "textures/terminals/terminalscreen01.dds".into(),
+            dds_block(b"DXT1", 4, 4, &dxt1_block(0, u16::MAX, 0)),
+        );
+        let output = encode_glb(&scene, &textures, &GlbOptions::default())
             .expect("encode terminal screen GLB");
         let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
         let document: serde_json::Value =
@@ -1276,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn untextured_effect_shader_uses_base_color_for_physical_bulb_emission() {
+    fn untextured_no_lighting_material_does_not_emit_by_default() {
         let scene = Scene {
             nodes: Vec::new(),
             roots: Vec::new(),
@@ -1316,39 +1329,38 @@ mod tests {
 
         assert_eq!(
             material["emissiveFactor"],
-            serde_json::json!([1.0, 0.75, 0.25])
+            serde_json::json!([0.0, 0.0, 0.0])
         );
         assert!(material["extensions"]["KHR_materials_unlit"].is_null());
         assert_eq!(
             material["pbrMetallicRoughness"]["baseColorFactor"],
             serde_json::json!([0.0, 0.0, 0.0, 1.0])
         );
-        assert_eq!(
-            material["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
-            serde_json::json!(0.25)
-        );
+        assert!(material["extensions"]["KHR_materials_emissive_strength"].is_null());
         assert_eq!(
             material["extras"]["bevyout_fallout_material"]["emission_authorized"],
-            true
+            false
         );
     }
 
     #[test]
     fn named_glow_assets_keep_authorized_emission() {
-        for (name, shader_type, shader_flags_2, unlit) in [
+        for (name, shader_type, shader_flags_2, unlit, emissive_multiplier) in [
             (
                 "MS05NukaColaQtm",
                 super::super::SHADER_TYPE_ENVIRONMENT_MAP,
                 0,
                 false,
+                15.0,
             ),
             (
                 "GlowLamp",
                 super::super::SHADER_TYPE_ENVIRONMENT_MAP,
-                0,
+                super::super::SHADER_FLAG2_GLOW_MAP,
                 false,
+                1.0,
             ),
-            ("TerminalScreen", 33, 0, true),
+            ("TerminalScreen", 33, 0, true, 1.0),
         ] {
             let scene = Scene {
                 nodes: Vec::new(),
@@ -1357,13 +1369,14 @@ mod tests {
                     name: name.into(),
                     base_color: [1.0; 4],
                     emissive: [0.2, 0.4, 0.6],
-                    emissive_multiplier: 1.0,
+                    emissive_multiplier,
                     roughness: 0.5,
                     alpha_mode: SceneAlphaMode::Opaque,
                     alpha_cutoff: None,
                     double_sided: false,
                     unlit,
-                    diffuse_texture: None,
+                    diffuse_texture: (name == "TerminalScreen")
+                        .then(|| "textures/terminals/terminalscreen01.dds".into()),
                     normal_texture: None,
                     specular_texture: None,
                     glow_texture: None,
@@ -1380,7 +1393,14 @@ mod tests {
                 animations: Vec::new(),
                 animation_sound_cues: Vec::new(),
             };
-            let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
+            let mut textures = BTreeMap::new();
+            if name == "TerminalScreen" {
+                textures.insert(
+                    "textures/terminals/terminalscreen01.dds".into(),
+                    dds_block(b"DXT1", 4, 4, &dxt1_block(0, u16::MAX, 0)),
+                );
+            }
+            let output = encode_glb(&scene, &textures, &GlbOptions::default())
                 .expect("encode named glow material");
             let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
             let document: serde_json::Value =
