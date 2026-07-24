@@ -10,8 +10,8 @@ use json::{
 use thiserror::Error;
 
 use super::{
-    FalloutShaderFeatures, FALLOUT_EMISSIVE_MAX, FALLOUT_EMISSIVE_SCALE, SHADER_TYPE_HAIR_TINT,
-    SHADER_TYPE_SKIN_TINT,
+    FalloutShaderFeatures, FALLOUT_EMISSIVE_MAX, FALLOUT_EMISSIVE_SCALE,
+    SHADER_TYPE_ENVIRONMENT_MAP, SHADER_TYPE_HAIR_TINT, SHADER_TYPE_SKIN_TINT,
 };
 use super::{
     Scene, SceneAlphaMode, SceneAnimation, SceneAnimationChannel, SceneMaterial, SceneMesh,
@@ -492,8 +492,17 @@ impl Writer<'_> {
         // unless the shader flags actually enable the glow map feature.
         // BSEffectShaderProperty is Fallout's explicit unlit/effect source
         // (used by terminal screens). It is authoritative even when the
-        // material has no slot-2 glow map or type-2 shader value.
-        let emission_authorized = features.glow_map || source.unlit;
+        // material has no slot-2 glow map or type-2 shader value. A constant
+        // authored emission is also valid when an environment-map material
+        // has no slot-2 source at all (Nuka Cola and light bulbs). An
+        // unflagged slot-2 source blocks that fallback, so RadAway's authored
+        // orange value cannot wash its whole mesh yellow.
+        let has_authored_emission = source.emissive.iter().any(|channel| *channel != 0.0);
+        let emission_authorized = features.glow_map
+            || source.unlit
+            || (has_authored_emission
+                && (source.shader_type != SHADER_TYPE_ENVIRONMENT_MAP
+                    || source.glow_texture.is_none()));
         let emissive_multiplier = if emission_authorized {
             (source.emissive_multiplier * FALLOUT_EMISSIVE_SCALE).clamp(0.0, FALLOUT_EMISSIVE_MAX)
         } else {
@@ -1257,11 +1266,16 @@ mod tests {
         for (name, shader_type, shader_flags_2, unlit) in [
             (
                 "MS05NukaColaQtm",
+                super::super::SHADER_TYPE_ENVIRONMENT_MAP,
                 0,
-                super::super::SHADER_FLAG2_GLOW_MAP,
                 false,
             ),
-            ("GlowLamp", 0, super::super::SHADER_FLAG2_GLOW_MAP, false),
+            (
+                "GlowLamp",
+                super::super::SHADER_TYPE_ENVIRONMENT_MAP,
+                0,
+                false,
+            ),
             ("TerminalScreen", 33, 0, true),
         ] {
             let scene = Scene {

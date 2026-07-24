@@ -1400,7 +1400,11 @@ fn make_material(
             .or_else(|| texture(0)),
         normal_texture: texture(1),
         specular_texture: features.specular.then(|| texture(7)).flatten(),
-        glow_texture: features.glow_map.then(|| texture(2)).flatten(),
+        // Preserve slot 2 even when its shader flag is absent. The GLB writer
+        // will keep it out of emissiveTexture, but its presence is evidence
+        // that a constant authored emission must not be promoted on an
+        // unflagged environment-map material (RadAway's `_g` case).
+        glow_texture: texture(2),
         height_texture: features.parallax.then(|| texture(3)).flatten(),
         environment_texture: features.environment_mapping.then(|| texture(4)).flatten(),
         environment_mask: features.environment_mapping.then(|| texture(5)).flatten(),
