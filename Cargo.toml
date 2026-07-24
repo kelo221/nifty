@@ -30,8 +30,8 @@ anyhow = "1.0.72"
 thiserror = "1.0.43"
 glam = "0.28.0"
 half = "2.7"
-gltf = { version = "1.4.1", optional = true, features = ["names", "extras", "KHR_materials_unlit", "KHR_materials_emissive_strength", "KHR_materials_specular"] }
-gltf-json = { version = "1.4.1", optional = true, features = ["names", "extras", "KHR_materials_unlit", "KHR_materials_emissive_strength", "KHR_materials_specular"] }
+gltf = { version = "1.4.1", optional = true, features = ["names", "extras", "KHR_materials_unlit", "KHR_materials_emissive_strength", "KHR_materials_specular", "KHR_materials_volume"] }
+gltf-json = { version = "1.4.1", optional = true, features = ["names", "extras", "KHR_materials_unlit", "KHR_materials_emissive_strength", "KHR_materials_specular", "KHR_materials_volume"] }
 image = { version = "0.25.10", default-features = false, features = ["dds", "png"], optional = true }
 serde_json = { version = "1.0", features = ["raw_value"], optional = true }
 binrw = "0.14.0"

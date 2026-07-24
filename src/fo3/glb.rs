@@ -9,6 +9,7 @@ use json::{
 };
 use thiserror::Error;
 
+use super::{FalloutShaderFeatures, SHADER_TYPE_HAIR_TINT, SHADER_TYPE_SKIN_TINT};
 use super::{
     Scene, SceneAlphaMode, SceneAnimation, SceneAnimationChannel, SceneMaterial, SceneMesh,
     SceneSkin,
@@ -476,6 +477,23 @@ impl Writer<'_> {
             .map(|path| self.texture(path))
             .transpose()?
             .flatten();
+        let features = FalloutShaderFeatures::from_flags(
+            source.shader_type,
+            source.shader_flags_1,
+            source.shader_flags_2,
+        );
+        let translucency_strength = if features.back_lighting {
+            0.35
+        } else if features.soft_lighting {
+            0.2
+        } else if matches!(
+            source.shader_type,
+            SHADER_TYPE_SKIN_TINT | SHADER_TYPE_HAIR_TINT
+        ) {
+            0.15
+        } else {
+            0.0
+        };
         let texture_info = |index| json::texture::Info {
             index,
             tex_coord: 0,
@@ -560,7 +578,31 @@ impl Writer<'_> {
             emissive_texture: glow.map(texture_info),
             emissive_factor: material::EmissiveFactor(source.emissive),
             extensions,
-            extras: Default::default(),
+            extras: extras(serde_json::json!({
+                "bevyout_fallout_material": {
+                    "schema": 1,
+                    "shader_type": source.shader_type,
+                    "shader_flags_1": source.shader_flags_1,
+                    "shader_flags_2": source.shader_flags_2,
+                    "features": {
+                        "glow_map": features.glow_map,
+                        "specular": features.specular,
+                        "parallax": features.parallax,
+                        "environment_mapping": features.environment_mapping,
+                        "double_sided": features.double_sided,
+                        "vertex_colors": features.vertex_colors,
+                        "vertex_alpha": features.vertex_alpha,
+                        "soft_lighting": features.soft_lighting,
+                        "back_lighting": features.back_lighting,
+                    },
+                    "translucency_enabled": features.translucent_candidate,
+                    "translucency_strength": translucency_strength,
+                    "emissive_multiplier": source.emissive_multiplier,
+                    "environment_texture": source.environment_texture,
+                    "environment_mask": source.environment_mask,
+                    "height_texture": source.height_texture,
+                }
+            }))?,
         })
     }
 
@@ -993,6 +1035,12 @@ mod tests {
                 normal_texture: None,
                 specular_texture: None,
                 glow_texture: None,
+                height_texture: None,
+                environment_texture: None,
+                environment_mask: None,
+                shader_type: 0,
+                shader_flags_1: super::super::SHADER_FLAG1_SPECULAR,
+                shader_flags_2: super::super::SHADER_FLAG2_GLOW_MAP,
             }],
             skins: Vec::new(),
             issues: Vec::new(),
@@ -1007,6 +1055,17 @@ mod tests {
         );
         let output = encode_glb(&scene, &textures, &GlbOptions::default()).expect("encode GLB");
         let gltf = gltf::Gltf::from_slice(&output.bytes).expect("validate GLB");
+        let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.bytes[20..20 + json_length]).unwrap();
+        assert_eq!(
+            document["materials"][0]["extras"]["bevyout_fallout_material"]["features"]["glow_map"],
+            true
+        );
+        assert_eq!(
+            document["materials"][0]["extras"]["bevyout_fallout_material"]["features"]["specular"],
+            true
+        );
         assert_eq!(
             gltf.document.materials().next().unwrap().alpha_mode(),
             gltf::material::AlphaMode::Mask

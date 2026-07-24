@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use super::{
     AlphaProperty, AnimationKey, AnimationKeyGroup, AvObject, Document, Geometry, GeometryData,
-    MaterialProperty, NoLightingProperty, Node, PpLightingProperty, ShaderTextureSet, SkinData,
+    MaterialProperty, NoLightingProperty, Node, ShaderProperty, ShaderTextureSet, SkinData,
     SkinInstance, SkinPartitionData, TextKeyExtraData, Transform, TransformData,
     TransformInterpolator, TriStripsData, TypedBlock,
 };
@@ -32,6 +32,12 @@ pub struct SceneMaterial {
     pub normal_texture: Option<String>,
     pub specular_texture: Option<String>,
     pub glow_texture: Option<String>,
+    pub height_texture: Option<String>,
+    pub environment_texture: Option<String>,
+    pub environment_mask: Option<String>,
+    pub shader_type: u32,
+    pub shader_flags_1: u32,
+    pub shader_flags_2: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1089,11 +1095,15 @@ impl SceneBuilder<'_> {
             }
             _ => None,
         };
+        let shader = pp_shader
+            .as_ref()
+            .map(|value| &value.base)
+            .or_else(|| no_lighting.as_ref().map(|value| &value.base));
         let material = make_material(
             geometry,
             material_property.as_ref(),
             alpha_property.as_ref(),
-            pp_shader.as_ref(),
+            shader,
             no_lighting.as_ref(),
             textures.as_ref(),
         );
@@ -1341,7 +1351,7 @@ fn make_material(
     geometry: &Geometry,
     material: Option<&MaterialProperty>,
     alpha: Option<&AlphaProperty>,
-    _pp_shader: Option<&PpLightingProperty>,
+    shader: Option<&ShaderProperty>,
     no_lighting: Option<&NoLightingProperty>,
     textures: Option<&ShaderTextureSet>,
 ) -> SceneMaterial {
@@ -1363,23 +1373,40 @@ fn make_material(
             .map(|path| normalize_texture_path(path))
             .filter(|path| !path.is_empty())
     };
+    let shader_type = shader.map_or(0, |value| value.shader_type);
+    let shader_flags_1 = shader.map_or(0, |value| value.shader_flags);
+    let shader_flags_2 = shader.map_or(0, |value| value.shader_flags_2);
+    let features =
+        super::FalloutShaderFeatures::from_flags(shader_type, shader_flags_1, shader_flags_2);
+    let diffuse_color = material.and_then(|value| value.diffuse).unwrap_or([1.0; 3]);
     SceneMaterial {
         name,
-        base_color: [1.0, 1.0, 1.0, alpha_value],
+        base_color: [
+            diffuse_color[0].max(0.0),
+            diffuse_color[1].max(0.0),
+            diffuse_color[2].max(0.0),
+            alpha_value,
+        ],
         emissive: material.map_or([0.0; 3], |value| value.emissive),
         emissive_multiplier: material.map_or(1.0, |value| value.emissive_multiplier.max(0.0)),
         roughness: material_roughness_policy(material.map(|value| value.glossiness)),
         alpha_mode,
         alpha_cutoff,
-        double_sided: false,
+        double_sided: features.double_sided,
         unlit: no_lighting.is_some(),
         diffuse_texture: no_lighting
             .map(|value| normalize_texture_path(&value.file_name))
             .filter(|path| !path.is_empty())
             .or_else(|| texture(0)),
         normal_texture: texture(1),
-        specular_texture: texture(1),
-        glow_texture: texture(2),
+        specular_texture: features.specular.then(|| texture(7)).flatten(),
+        glow_texture: features.glow_map.then(|| texture(2)).flatten(),
+        height_texture: features.parallax.then(|| texture(3)).flatten(),
+        environment_texture: features.environment_mapping.then(|| texture(4)).flatten(),
+        environment_mask: features.environment_mapping.then(|| texture(5)).flatten(),
+        shader_type,
+        shader_flags_1,
+        shader_flags_2,
     }
 }
 

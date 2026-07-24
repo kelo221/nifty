@@ -10,6 +10,7 @@ mod glb;
 mod physics;
 mod reader;
 mod scene;
+mod shader;
 mod typed;
 
 pub use error::Fo3Error;
@@ -17,6 +18,7 @@ pub use error::Fo3Error;
 pub use glb::*;
 pub use physics::*;
 pub use scene::*;
+pub use shader::*;
 pub use typed::*;
 
 use reader::Reader;
