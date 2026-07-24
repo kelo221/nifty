@@ -490,7 +490,10 @@ impl Writer<'_> {
         // NIF material can still carry a nonzero authored emissive color (and
         // an adjacent `_g` texture), but those values are not authoritative
         // unless the shader flags actually enable the glow map feature.
-        let emission_authorized = features.glow_map;
+        // BSEffectShaderProperty is Fallout's explicit unlit/effect source
+        // (used by terminal screens). It is authoritative even when the
+        // material has no slot-2 glow map or type-2 shader value.
+        let emission_authorized = features.glow_map || source.unlit;
         let emissive_multiplier = if emission_authorized {
             (source.emissive_multiplier * FALLOUT_EMISSIVE_SCALE).clamp(0.0, FALLOUT_EMISSIVE_MAX)
         } else {
@@ -1193,6 +1196,59 @@ mod tests {
         assert_eq!(
             gltf.document.materials().next().unwrap().alpha_mode(),
             gltf::material::AlphaMode::Blend
+        );
+    }
+
+    #[test]
+    fn effect_shader_terminal_screen_preserves_explicit_emission() {
+        let scene = Scene {
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            materials: vec![SceneMaterial {
+                name: "TerminalScreen".into(),
+                base_color: [1.0; 4],
+                emissive: [0.9686275, 0.9686275, 0.9686275],
+                emissive_multiplier: 1.0,
+                roughness: 0.5,
+                alpha_mode: SceneAlphaMode::Opaque,
+                alpha_cutoff: None,
+                double_sided: false,
+                unlit: true,
+                diffuse_texture: None,
+                normal_texture: None,
+                specular_texture: None,
+                glow_texture: None,
+                height_texture: None,
+                environment_texture: None,
+                environment_mask: None,
+                shader_type: 33,
+                shader_flags_1: 0,
+                shader_flags_2: 0,
+            }],
+            skins: Vec::new(),
+            issues: Vec::new(),
+            statistics: super::super::SceneStatistics::default(),
+            animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
+        };
+        let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
+            .expect("encode terminal screen GLB");
+        let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.bytes[20..20 + json_length]).unwrap();
+        let material = &document["materials"][0];
+
+        assert_eq!(
+            material["emissiveFactor"],
+            serde_json::json!([0.9686275, 0.9686275, 0.9686275])
+        );
+        assert_eq!(
+            material["extensions"]["KHR_materials_unlit"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            material["extras"]["bevyout_fallout_material"]["emission_authorized"],
+            true
         );
     }
 
