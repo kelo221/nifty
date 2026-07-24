@@ -1253,6 +1253,65 @@ mod tests {
     }
 
     #[test]
+    fn named_glow_assets_keep_authorized_emission() {
+        for (name, shader_type, shader_flags_2, unlit) in [
+            (
+                "MS05NukaColaQtm",
+                0,
+                super::super::SHADER_FLAG2_GLOW_MAP,
+                false,
+            ),
+            ("GlowLamp", 0, super::super::SHADER_FLAG2_GLOW_MAP, false),
+            ("TerminalScreen", 33, 0, true),
+        ] {
+            let scene = Scene {
+                nodes: Vec::new(),
+                roots: Vec::new(),
+                materials: vec![SceneMaterial {
+                    name: name.into(),
+                    base_color: [1.0; 4],
+                    emissive: [0.2, 0.4, 0.6],
+                    emissive_multiplier: 1.0,
+                    roughness: 0.5,
+                    alpha_mode: SceneAlphaMode::Opaque,
+                    alpha_cutoff: None,
+                    double_sided: false,
+                    unlit,
+                    diffuse_texture: None,
+                    normal_texture: None,
+                    specular_texture: None,
+                    glow_texture: None,
+                    height_texture: None,
+                    environment_texture: None,
+                    environment_mask: None,
+                    shader_type,
+                    shader_flags_1: 0,
+                    shader_flags_2,
+                }],
+                skins: Vec::new(),
+                issues: Vec::new(),
+                statistics: super::super::SceneStatistics::default(),
+                animations: Vec::new(),
+                animation_sound_cues: Vec::new(),
+            };
+            let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
+                .expect("encode named glow material");
+            let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
+            let document: serde_json::Value =
+                serde_json::from_slice(&output.bytes[20..20 + json_length]).unwrap();
+            let material = &document["materials"][0];
+            assert_eq!(
+                material["emissiveFactor"],
+                serde_json::json!([0.2, 0.4, 0.6])
+            );
+            assert_eq!(
+                material["extras"]["bevyout_fallout_material"]["emission_authorized"], true,
+                "{name} lost its authoritative emission"
+            );
+        }
+    }
+
+    #[test]
     fn encoded_glb_preserves_skin_joints_and_weights() {
         let identity = [
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
