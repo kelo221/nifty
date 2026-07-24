@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use thiserror::Error;
 
+use super::SHADER_FLAG2_GLOW_MAP;
 use super::{
     AlphaProperty, AnimationKey, AnimationKeyGroup, AvObject, Document, Geometry, GeometryData,
     MaterialProperty, NoLightingProperty, Node, ShaderProperty, ShaderTextureSet, SkinData,
@@ -488,9 +489,85 @@ pub fn extract_scene(document: &Document) -> Result<Scene, SceneError> {
     if builder.scene.roots.is_empty() {
         return Err(SceneError::NoRoots);
     }
+    normalize_effect_glow_cards(&mut builder.scene);
     builder.scene.animations = extract_animations(document, &builder.scene.nodes)?;
     builder.scene.animation_sound_cues = extract_animation_sound_cues(document)?;
     Ok(builder.scene)
+}
+
+/// Fallout light fixtures commonly contain a separate untextured alpha card
+/// beside the real textured fixture. The card is only a renderer hint: if it
+/// survives conversion as a uniform emissive mesh it becomes a large white
+/// rectangle and can also contaminate shadow/bake inputs. Use the explicit
+/// sibling relationship as the physical-bulb authority, then remove the card
+/// and promote the body's glow texture (or diffuse color when no glow map is
+/// available). This is deliberately relationship-based rather than filename
+/// based, so an unrelated `_g` texture such as RadAway remains non-emissive.
+fn normalize_effect_glow_cards(scene: &mut Scene) {
+    for parent_index in 0..scene.nodes.len() {
+        let children = scene.nodes[parent_index].children.clone();
+        let glow_cards = children
+            .iter()
+            .copied()
+            .filter(|&child| is_effect_glow_card(scene, child))
+            .collect::<Vec<_>>();
+        if glow_cards.is_empty() {
+            continue;
+        }
+
+        let bulb_materials = children
+            .iter()
+            .copied()
+            .filter(|child| !glow_cards.contains(child))
+            .filter_map(|child| scene.nodes[child].mesh.as_ref()?.material)
+            .collect::<HashSet<_>>();
+        for material_index in bulb_materials {
+            let Some(material) = scene.materials.get_mut(material_index) else {
+                continue;
+            };
+            if material.glow_texture.is_some() {
+                material.shader_flags_2 |= SHADER_FLAG2_GLOW_MAP;
+            } else if material.emissive.iter().all(|channel| *channel == 0.0) {
+                material.emissive = [
+                    material.base_color[0],
+                    material.base_color[1],
+                    material.base_color[2],
+                ];
+            }
+        }
+
+        for card_index in glow_cards {
+            let Some(mesh) = scene.nodes[card_index].mesh.take() else {
+                continue;
+            };
+            scene.statistics.source_meshes = scene.statistics.source_meshes.saturating_sub(1);
+            scene.statistics.source_vertices = scene
+                .statistics
+                .source_vertices
+                .saturating_sub(mesh.positions.len());
+            scene.statistics.source_triangles = scene
+                .statistics
+                .source_triangles
+                .saturating_sub(mesh.indices.len() / 3);
+        }
+    }
+}
+
+fn is_effect_glow_card(scene: &Scene, node_index: usize) -> bool {
+    let Some(mesh) = scene
+        .nodes
+        .get(node_index)
+        .and_then(|node| node.mesh.as_ref())
+    else {
+        return false;
+    };
+    let Some(material) = mesh.material.and_then(|index| scene.materials.get(index)) else {
+        return false;
+    };
+    material.unlit
+        && material.diffuse_texture.is_none()
+        && material.alpha_mode == SceneAlphaMode::Blend
+        && mesh.colors.iter().any(|color| color[3] < 0.999)
 }
 
 fn extract_animation_sound_cues(
@@ -1654,6 +1731,97 @@ mod tests {
             normalize_texture_path("\\Textures\\Clutter\\Desk.DDS\0"),
             "textures/clutter/desk.dds"
         );
+    }
+
+    #[test]
+    fn effect_glow_card_is_removed_and_sibling_glow_map_is_promoted() {
+        let material = |name: &str, unlit: bool, glow_texture: Option<&str>| SceneMaterial {
+            name: name.into(),
+            base_color: [1.0, 0.75, 0.25, 1.0],
+            emissive: [0.0, 0.0, 0.0],
+            emissive_multiplier: 1.0,
+            roughness: 0.5,
+            alpha_mode: if unlit {
+                SceneAlphaMode::Blend
+            } else {
+                SceneAlphaMode::Opaque
+            },
+            alpha_cutoff: None,
+            double_sided: false,
+            unlit,
+            diffuse_texture: None,
+            normal_texture: None,
+            specular_texture: None,
+            glow_texture: glow_texture.map(str::to_owned),
+            height_texture: None,
+            environment_texture: None,
+            environment_mask: None,
+            shader_type: if unlit {
+                33
+            } else {
+                super::super::SHADER_TYPE_ENVIRONMENT_MAP
+            },
+            shader_flags_1: 0,
+            shader_flags_2: 0,
+        };
+        let mesh = |name: &str, material: usize, alpha: f32| SceneMesh {
+            name: name.into(),
+            positions: vec![[0.0, 0.0, 0.0]; 3],
+            normals: Vec::new(),
+            tangents: Vec::new(),
+            colors: vec![[0.0, 0.0, 0.0, alpha]; 3],
+            tex_coords: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: vec![0, 1, 2],
+            material: Some(material),
+        };
+        let mut scene = empty_scene(
+            vec![
+                SceneNode {
+                    source_block: 0,
+                    name: "RCLightBox01".into(),
+                    transform: identity_transform(),
+                    children: vec![1, 2],
+                    mesh: None,
+                    skin: None,
+                },
+                SceneNode {
+                    source_block: 1,
+                    name: "RCLightBox01:5".into(),
+                    transform: identity_transform(),
+                    children: Vec::new(),
+                    mesh: Some(mesh("RCLightBox01:5", 0, 0.7)),
+                    skin: None,
+                },
+                SceneNode {
+                    source_block: 2,
+                    name: "RCLightBox01:6".into(),
+                    transform: identity_transform(),
+                    children: Vec::new(),
+                    mesh: Some(mesh("RCLightBox01:6", 1, 1.0)),
+                    skin: None,
+                },
+            ],
+            vec![0],
+        );
+        scene.materials = vec![
+            material("card", true, None),
+            material("fixture", false, Some("rclight01_g.dds")),
+        ];
+        scene.statistics = SceneStatistics {
+            source_meshes: 2,
+            source_vertices: 6,
+            source_triangles: 2,
+        };
+
+        normalize_effect_glow_cards(&mut scene);
+
+        assert!(scene.nodes[1].mesh.is_none());
+        assert!(scene.materials[1].shader_flags_2 & super::SHADER_FLAG2_GLOW_MAP != 0);
+        assert_eq!(scene.statistics.source_meshes, 1);
+        assert_eq!(scene.statistics.source_vertices, 3);
+        assert_eq!(scene.statistics.source_triangles, 1);
     }
 
     fn identity_transform() -> Transform {
