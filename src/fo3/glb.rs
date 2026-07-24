@@ -491,13 +491,17 @@ impl Writer<'_> {
         // an adjacent `_g` texture), but those values are not authoritative
         // unless the shader flags actually enable the glow map feature.
         // BSEffectShaderProperty is Fallout's explicit unlit/effect source
-        // (used by terminal screens). It is authoritative even when the
-        // material has no slot-2 glow map or type-2 shader value. A constant
-        // authored emission is also valid when an environment-map material
-        // has no slot-2 source at all (Nuka Cola and light bulbs). An
-        // unflagged slot-2 source blocks that fallback, so RadAway's authored
-        // orange value cannot wash its whole mesh yellow.
+        // (used by terminal screens and physical light cards). It is
+        // authoritative even when the material has no slot-2 glow map or
+        // type-2 shader value. If it has no authored emissive color, use the
+        // effect material's base color (and diffuse map, when present) as the
+        // physical bulb source. A constant authored emission is also valid
+        // when an environment-map material has no slot-2 source at all (Nuka
+        // Cola and authored light bulbs). An unflagged slot-2 source blocks
+        // that fallback, so RadAway's authored orange value cannot wash its
+        // whole mesh yellow.
         let has_authored_emission = source.emissive.iter().any(|channel| *channel != 0.0);
+        let effect_shader_fallback = source.unlit && !has_authored_emission;
         let emission_authorized = features.glow_map
             || source.unlit
             || (has_authored_emission
@@ -508,8 +512,14 @@ impl Writer<'_> {
         } else {
             1.0
         };
-        let emissive_factor = if emission_authorized {
+        let emissive_factor = if emission_authorized && has_authored_emission {
             source.emissive
+        } else if emission_authorized && effect_shader_fallback {
+            [
+                source.base_color[0].max(0.0),
+                source.base_color[1].max(0.0),
+                source.base_color[2].max(0.0),
+            ]
         } else {
             [0.0; 3]
         };
@@ -525,6 +535,13 @@ impl Writer<'_> {
         } else {
             0.0
         };
+        let effect_emission_texture = effect_shader_fallback
+            .then(|| source.diffuse_texture.as_deref())
+            .flatten()
+            .map(|path| self.texture(path))
+            .transpose()?
+            .flatten();
+        let emissive_texture = glow.or(effect_emission_texture);
         let texture_info = |index| json::texture::Info {
             index,
             tex_coord: 0,
@@ -608,7 +625,7 @@ impl Writer<'_> {
                 extras: Default::default(),
             }),
             occlusion_texture: None,
-            emissive_texture: glow.map(texture_info),
+            emissive_texture: emissive_texture.map(texture_info),
             emissive_factor: material::EmissiveFactor(emissive_factor),
             extensions,
             extras: extras(serde_json::json!({
@@ -1254,6 +1271,59 @@ mod tests {
         assert_eq!(
             material["extensions"]["KHR_materials_unlit"],
             serde_json::json!({})
+        );
+        assert_eq!(
+            material["extras"]["bevyout_fallout_material"]["emission_authorized"],
+            true
+        );
+    }
+
+    #[test]
+    fn untextured_effect_shader_uses_base_color_for_physical_bulb_emission() {
+        let scene = Scene {
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            materials: vec![SceneMaterial {
+                name: "RCLightBox01:5".into(),
+                base_color: [1.0, 0.75, 0.25, 1.0],
+                emissive: [0.0; 3],
+                emissive_multiplier: 1.0,
+                roughness: 0.5,
+                alpha_mode: SceneAlphaMode::Opaque,
+                alpha_cutoff: None,
+                double_sided: false,
+                unlit: true,
+                diffuse_texture: None,
+                normal_texture: None,
+                specular_texture: None,
+                glow_texture: None,
+                height_texture: None,
+                environment_texture: None,
+                environment_mask: None,
+                shader_type: 33,
+                shader_flags_1: 0,
+                shader_flags_2: 0,
+            }],
+            skins: Vec::new(),
+            issues: Vec::new(),
+            statistics: super::super::SceneStatistics::default(),
+            animations: Vec::new(),
+            animation_sound_cues: Vec::new(),
+        };
+        let output = encode_glb(&scene, &BTreeMap::new(), &GlbOptions::default())
+            .expect("encode physical bulb GLB");
+        let json_length = u32::from_le_bytes(output.bytes[12..16].try_into().unwrap()) as usize;
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.bytes[20..20 + json_length]).unwrap();
+        let material = &document["materials"][0];
+
+        assert_eq!(
+            material["emissiveFactor"],
+            serde_json::json!([1.0, 0.75, 0.25])
+        );
+        assert_eq!(
+            material["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+            serde_json::json!(0.25)
         );
         assert_eq!(
             material["extras"]["bevyout_fallout_material"]["emission_authorized"],
